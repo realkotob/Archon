@@ -20,6 +20,7 @@ That's what **DAG workflows** (Directed Acyclic Graphs) are for. Instead of a st
 |---------------|--------------|
 | Simple sequence, one after another | Sequential `nodes:` with `depends_on` |
 | Repeat until done | `loop:` node |
+| Repeat a multi-step pipeline until done | `loop_group:` node |
 | Skip a node based on previous output | `when:` condition |
 | Fan out to different handlers based on classified input | `output_format` + `when:` routing |
 | Express exactly which nodes depend on which | `depends_on` edges |
@@ -167,12 +168,18 @@ This time `plan` runs; `investigate` is skipped. The same workflow, two paths.
 `when:` evaluates a condition before running a node. If the condition is false, the node is skipped:
 
 ```yaml
-when: "$nodeId.output == 'VALUE'"
+when: "$nodeId.output == 'VALUE'"         # whole output — bash:/script: producers only
 when: "$nodeId.output != 'VALUE'"
 when: "$nodeId.output.field == 'VALUE'"   # JSON field access
+when: "$INPUTS.name == 'VALUE'"           # a declared input supplied by the caller
 ```
 
-If the expression is invalid or can't be evaluated, Archon fails open — the node runs rather than silently skipping.
+Two failure modes, by design:
+
+- An **invalid/unparseable expression** (bad syntax) is fail-closed — the node is **skipped**.
+- A `$node.output.field` **reference that can't resolve** — a field not declared in the producer's `output_format` schema, or a schemaless node whose output isn't JSON or lacks that key — **fails the node** (it is not silently treated as empty). The one exception: a field the producer declared **optional** but left absent resolves to `''`. Whole-text `$node.output` never fails. A `$INPUTS.<name>` the run does not carry likewise **fails the node**.
+
+Comparing the **whole output** of an AI producer (`prompt:`, `command:`, `loop:`, `loop_group:` with no `output_format`) to a literal is rejected when the workflow loads — a model's free-form reply is never byte-identical to `BUG`, so the comparison would silently skip the node. Declare `output_format` and compare a field. See [`when:` Condition Syntax](/guides/authoring-workflows/#when-condition-syntax).
 
 ### Accessing Node Output
 
@@ -221,29 +228,39 @@ When a node has multiple dependencies and some might be skipped, `trigger_rule` 
 |-------|----------|
 | `all_success` | Run only if all upstream deps completed successfully (default) |
 | `one_success` | Run if at least one upstream dep completed successfully |
-| `none_failed_min_one_success` | Run if no deps failed AND at least one succeeded (skipped deps are OK) |
+| `none_failed_min_one_success` | Run if at least one dependency succeeded and none failed or skipped because of an upstream failure (`upstream_failed`) |
 | `all_done` | Run when all deps are in a terminal state (completed, failed, or skipped) |
 
-The classify-and-route example uses `none_failed_min_one_success` on `implement` because exactly one of `investigate` or `plan` will be skipped. The default `all_success` would fail because a skipped node doesn't count as a success.
+The classify-and-route example uses `none_failed_min_one_success` on `implement` because exactly one of `investigate` or `plan` will be skipped. The default `all_success` would skip `implement` because a skipped node doesn't count as a success.
+
+A skip caused by an upstream failure is different: `none_failed_min_one_success`
+blocks it by default, even when another dependency succeeded. This applies across
+chains and includes, and the skip cause retains the original failed node. Condition
+skips and optional timeout skips (`on_timeout: skip`) remain admissible with a successful
+dependency. `if_skipped` affects output bindings, not trigger eligibility.
 
 ---
 
 ## Node Types
 
-Archon supports four node types:
+Archon supports eight node types. Exactly one mode field is required per node:
 
 | Type | Syntax | When to use |
 |------|--------|-------------|
-| **Command** | `command: my-command` | Load a command from `.archon/commands/my-command.md`. The standard choice. |
+| **Command** | `command: my-command` | Load from the owning package in packaged workflows, or shared command lookup in legacy workflows. The standard choice. |
 | **Prompt** | `prompt: "inline instructions..."` | Quick, one-off instructions that don't need a reusable command file. |
 | **Bash** | `bash: "shell command"` | Run a shell script without AI. Stdout is captured as `$nodeId.output`. Deterministic operations only. |
+| **Script** | `script: "..."` + `runtime: bun \| uv` | Run TypeScript/JavaScript (bun) or Python (uv) without AI. Inline code or a package-local/shared named reference. Stdout captured as `$nodeId.output`. See [Script Nodes](/guides/script-nodes/). |
 | **Loop** | `loop: { prompt: "...", until: SIGNAL }` | Repeat an AI prompt until a completion signal appears in the output. See [Loop Nodes](/guides/loop-nodes/). |
+| **Loop Group** | `loop_group: { until: SIGNAL, nodes: [...] }` | Repeat a multi-node sub-DAG body until a completion condition is met (cross-node iteration). See [Loop Nodes](/guides/loop-nodes/). |
+| **Approval** | `approval: { message: "..." }` | Pause the workflow for a human approve/reject decision. See [Approval Nodes](/guides/approval-nodes/). |
+| **Cancel** | `cancel: "reason string"` | Terminate the workflow run (status: cancelled, not failed). Usually gated with `when:`. |
 
 **Command** is the most common. Use it for anything you'll reuse across workflows.
 
 **Prompt** is convenient for glue nodes — summarizing outputs, formatting data — where the logic is simple and workflow-specific.
 
-**Bash** is powerful for deterministic operations: running tests, checking git status, reading a file, fetching an API. The AI doesn't run the bash command; your shell does. The output becomes a variable for downstream nodes:
+**Bash** is powerful for deterministic shell operations: running tests, checking git status, reading a file, fetching an API. The AI doesn't run the bash command; your shell does. The output becomes a variable for downstream nodes:
 
 ```yaml
 - id: check-tests
@@ -253,6 +270,22 @@ Archon supports four node types:
   command: fix-test-failures
   depends_on: [check-tests]
   prompt: "Test output: $check-tests.output\n\nFix any failures."
+```
+
+**Script** is for deterministic work that needs a real programming language — parsing JSON, transforming data between AI nodes, calling typed HTTP clients. Use `runtime: bun` for TypeScript/JavaScript and `runtime: uv` for Python:
+
+```yaml
+- id: transform
+  script: |
+    const raw = process.env.UPSTREAM ?? '{}';
+    const items = JSON.parse(raw).items ?? [];
+    console.log(JSON.stringify({ count: items.length }));
+  runtime: bun
+
+- id: analyze
+  script: analyze-metrics        # Named script: .archon/scripts/analyze-metrics.py
+  runtime: uv
+  deps: ["pandas>=2.0"]          # uv-only; bun auto-installs imports
 ```
 
 **Loop** is for iterative tasks where you don't know how many steps it will take. The AI runs until it emits a completion signal:
@@ -269,6 +302,32 @@ Archon supports four node types:
     fresh_context: true
 ```
 
+**Approval** pauses the workflow for human review. The downstream nodes don't run until the user approves in chat, CLI, or web UI:
+
+```yaml
+interactive: true                 # required at workflow level for web UI delivery
+
+nodes:
+  - id: plan
+    command: plan-feature
+  - id: review-gate
+    approval:
+      message: "Review the plan above."
+    depends_on: [plan]
+  - id: implement
+    command: implement
+    depends_on: [review-gate]
+```
+
+**Cancel** terminates the workflow with a reason string. Pair with `when:` for guarded exits — the run shows as `cancelled` rather than `failed`:
+
+```yaml
+- id: gate-branch
+  cancel: "Refusing to run on main — this workflow modifies files."
+  when: "$check-branch.output == 'main'"
+  depends_on: [check-branch]
+```
+
 ---
 
 ## Best Practices
@@ -281,7 +340,7 @@ Archon supports four node types:
 
 **Test with simple inputs first.** Before running your full workflow on real data, verify that each branch of a conditional routes correctly. Create a simple test input that's clearly a bug, confirm the BUG path runs. Then test with a clear feature request.
 
-**Let DAG resume handle failures.** If a long workflow fails partway through, run it again. Archon automatically skips nodes that already completed and resumes from where it left off. No `--resume` flag required.
+**Let DAG resume handle failures.** If a long workflow fails partway through, run `archon workflow run <name> --resume` (or `archon workflow resume <id>`) to skip nodes that already completed and continue from where it left off. Plain `archon workflow run` always starts fresh.
 
 ---
 

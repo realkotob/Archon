@@ -17,7 +17,7 @@ Connect Archon to Discord so you can interact with your AI coding assistant from
 
 ## Prerequisites
 
-- Archon server running (see [Getting Started](/getting-started/))
+- Archon server running (see [Getting Started](/getting-started/overview/))
 - A Discord account
 - "Manage Server" permission on the Discord server you want to add the bot to
 
@@ -39,6 +39,14 @@ Connect Archon to Discord so you can interact with your AI coding assistant from
 1. Scroll down to "Privileged Gateway Intents"
 2. Enable **"Message Content Intent"** (required for the bot to read messages)
 3. Save changes
+
+:::caution
+Skipping this step causes Discord to reject the bot's connection with
+`Used disallowed intents`. Archon will log
+`discord.start_failed_continuing_without_adapter` and keep the rest of
+the server running, but the Discord adapter will be unavailable until
+the intent is enabled and the server is restarted.
+:::
 
 ## Invite Bot to Your Server
 
@@ -81,11 +89,21 @@ DISCORD_STREAMING_MODE=batch  # batch (default) | stream
 
 For streaming mode details, see [Configuration](/getting-started/configuration/).
 
+## Configure Mention Requirement (Optional)
+
+By default the bot only activates in servers when @mentioned (DMs are exempt). On single-user or private servers you can opt out so the bot responds to any authorized message:
+
+```ini
+DISCORD_REQUIRE_MENTION=false  # true (default) | false
+```
+
+Only the literal value `false` disables the mention requirement. Mentions that are present are still stripped from the message.
+
 ## Usage
 
 The bot responds to:
 - **Direct Messages**: Just send messages directly
-- **Server Channels**: @mention the bot (e.g., `@YourBotName help me with this code`)
+- **Server Channels**: @mention the bot (e.g., `@YourBotName help me with this code`) — or any authorized message when `DISCORD_REQUIRE_MENTION=false`
 - **Threads**: Bot maintains context in thread conversations
 
 ## Further Reading

@@ -15,9 +15,15 @@ import {
   classifyAndFormatError,
   toError,
   onConversationClosed,
-  ConversationLockManager,
+  type ConversationLockManager,
 } from '@archon/core';
-import { getArchonWorkspacesPath, getCommandFolderSearchPaths, createLogger } from '@archon/paths';
+import * as userDb from '@archon/core/db/users';
+import {
+  ensureProjectStructure,
+  getCommandFolderSearchPaths,
+  getProjectSourcePath,
+  createLogger,
+} from '@archon/paths';
 import {
   cloneRepository,
   syncRepository,
@@ -28,6 +34,7 @@ import {
 } from '@archon/git';
 import * as db from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
+import { resolveDefaultAssistant } from '@archon/core/config/resolve-assistant';
 import { parseAllowedUsers, isGiteaUserAuthorized } from './auth';
 import { splitIntoParagraphChunks } from '../../../utils/message-splitting';
 import type { WebhookEvent } from './types';
@@ -44,20 +51,22 @@ const MAX_LENGTH = 65000; // Gitea comment limit (similar to GitHub)
 /** Hidden marker added to bot comments to prevent self-triggering loops */
 const BOT_RESPONSE_MARKER = '<!-- archon-bot-response -->';
 
+type ConversationLocker = Pick<ConversationLockManager, 'acquireLock'>;
+
 export class GiteaAdapter implements IPlatformAdapter {
   private baseUrl: string;
   private token: string;
   private webhookSecret: string;
   private allowedUsers: string[];
   private botMention: string;
-  private lockManager: ConversationLockManager;
+  private lockManager: ConversationLocker;
   private readonly retryDelayFn: (attempt: number) => number;
 
   constructor(
     baseUrl: string,
     token: string,
     webhookSecret: string,
-    lockManager: ConversationLockManager,
+    lockManager: ConversationLocker,
     botMention?: string,
     options?: { retryDelayMs?: (attempt: number) => number }
   ) {
@@ -520,29 +529,46 @@ export class GiteaAdapter implements IPlatformAdapter {
     // Directory doesn't exist - clone the repository
     getLog().info({ owner, repo, repoPath }, 'repo_cloning');
 
+    // Create project structure (source/, worktrees/, artifacts/, logs/) before
+    // cloning so worktree paths resolve correctly on first webhook clone.
+    await ensureProjectStructure(owner, repo);
+
     // Parse URL to get host for authenticated clone
     const urlObj = new URL(this.baseUrl);
     const repoUrl = `${urlObj.protocol}//${urlObj.host}/${owner}/${repo}.git`;
 
-    const cloneResult = await cloneRepository(repoUrl, toRepoPath(repoPath), {
-      token: process.env.GITEA_TOKEN,
-    });
+    const token = process.env.GITEA_TOKEN;
+    const cloneResult = await cloneRepository(
+      repoUrl,
+      toRepoPath(repoPath),
+      token ? { credentials: { username: token, password: '' } } : undefined
+    );
 
     if (!cloneResult.ok) {
       getLog().error({ owner, repo, repoPath, error: cloneResult.error }, 'repo_clone_failed');
 
-      if (cloneResult.error.code === 'not_a_repo') {
-        throw new Error(
-          `Repository ${owner}/${repo} not found or is private. Check repository access.`
-        );
+      switch (cloneResult.error.code) {
+        case 'not_a_repo':
+          throw new Error(
+            `Repository ${owner}/${repo} not found or is private. Check repository access.`
+          );
+        case 'permission_denied':
+          throw new Error(
+            `Authentication failed for ${owner}/${repo}. Check GITEA_TOKEN permissions.`
+          );
+        case 'no_space':
+          throw new Error(
+            `No space left while cloning ${owner}/${repo} to ${cloneResult.error.path}.`
+          );
+        case 'branch_not_found':
+          throw new Error(
+            `Failed to clone ${owner}/${repo}: branch ${cloneResult.error.branch} not found.`
+          );
+        case 'unknown':
+          throw new Error(`Failed to clone ${owner}/${repo}: ${cloneResult.error.message}`);
       }
-      if (cloneResult.error.code === 'permission_denied') {
-        throw new Error(
-          `Authentication failed for ${owner}/${repo}. Check GITEA_TOKEN permissions.`
-        );
-      }
-      const unknownMsg = (cloneResult.error as { message?: string }).message ?? 'unknown error';
-      throw new Error(`Failed to clone ${owner}/${repo}: ${unknownMsg}`);
+      const unhandled: never = cloneResult.error;
+      throw new Error(`Unhandled clone error: ${JSON.stringify(unhandled)}`);
     }
 
     await addSafeDirectory(toRepoPath(repoPath));
@@ -607,8 +633,10 @@ export class GiteaAdapter implements IPlatformAdapter {
     let existing = await codebaseDb.findCodebaseByRepoUrl(repoUrlNoGit);
     existing ??= await codebaseDb.findCodebaseByRepoUrl(repoUrlWithGit);
 
-    // Canonical path includes owner to prevent collisions between repos with same name
-    const canonicalPath = join(getArchonWorkspacesPath(), owner, repo);
+    // Canonical path uses the project source/ subdirectory so that worktrees/,
+    // artifacts/, and logs/ live as siblings of the cloned repo (not nested
+    // inside it). Mirrors the CLI /clone path; see issue #1547.
+    const canonicalPath = getProjectSourcePath(owner, repo);
 
     if (existing) {
       // Check if existing codebase points to a worktree path - fix it if so
@@ -631,6 +659,7 @@ export class GiteaAdapter implements IPlatformAdapter {
       name: `${owner}/${repo}`,
       repository_url: repoUrlNoGit,
       default_cwd: canonicalPath,
+      ai_assistant_type: await resolveDefaultAssistant(canonicalPath),
     });
 
     getLog().info({ codebaseName: codebase.name, path: canonicalPath }, 'codebase_created');
@@ -779,21 +808,44 @@ Use 'tea pr view ${String(pr.number)}' for full details if needed.`;
 
     getLog().info({ eventType, owner, repo, number, isPR }, 'webhook_processing');
 
-    // 6. Build conversationId
+    // Comment author may differ from event.sender for PR-review comments; prefer
+    // the comment author when present so individual reviewers get their own row.
+    // Resolution failure must not drop the webhook — warn-log and continue with
+    // archonUserId undefined so the conversation/run rows fall back to NULL.
+    // 6. Resolve webhook sender to Archon user UUID
+    const attributedLogin = commentAuthor ?? senderUsername;
+    let archonUserId: string | undefined;
+    if (attributedLogin) {
+      try {
+        const user = await userDb.findOrCreateUserByPlatformIdentity(
+          'gitea',
+          attributedLogin,
+          attributedLogin
+        );
+        archonUserId = user.id;
+      } catch (err) {
+        getLog().warn(
+          { err: toError(err), giteaLogin: attributedLogin },
+          'gitea.user_resolve_failed'
+        );
+      }
+    }
+
+    // 7. Build conversationId
     const conversationId = this.buildConversationId(owner, repo, number, isPR);
 
-    // 7. Check if new conversation
+    // 8. Check if new conversation
     const existingConv = await db.getOrCreateConversation('gitea', conversationId);
     const isNewConversation = !existingConv.codebase_id;
 
-    // 8. Get/create codebase (checks for existing first!)
+    // 9. Get/create codebase (checks for existing first!)
     const {
       codebase,
       repoPath,
       isNew: isNewCodebase,
     } = await this.getOrCreateCodebaseForRepo(owner, repo);
 
-    // 8b. Link conversation to codebase
+    // 9b. Link conversation to codebase
     if (isNewConversation) {
       try {
         await db.updateConversation(existingConv.id, {
@@ -813,18 +865,18 @@ Use 'tea pr view ${String(pr.number)}' for full details if needed.`;
       }
     }
 
-    // 9. Get default branch from repository info
+    // 10. Get default branch from repository info
     const defaultBranch = event.repository.default_branch;
 
-    // 10. Ensure repo ready (clone if needed, sync if new conversation)
+    // 11. Ensure repo ready (clone if needed, sync if new conversation)
     await this.ensureRepoReady(owner, repo, defaultBranch, repoPath, isNewCodebase);
 
-    // 11. Auto-load commands if new codebase
+    // 12. Auto-load commands if new codebase
     if (isNewCodebase) {
       await this.autoDetectAndLoadCommands(repoPath, codebase.id);
     }
 
-    // 12. Gather isolation hints for orchestrator
+    // 13. Gather isolation hints for orchestrator
     const isolationHints: IsolationHints = {
       workflowType: isPR ? 'pr' : 'issue',
       workflowId: String(number),
@@ -851,7 +903,7 @@ Use 'tea pr view ${String(pr.number)}' for full details if needed.`;
       );
     }
 
-    // 13. Build message with context
+    // 14. Build message with context
     const strippedComment = this.stripMention(comment);
     let finalMessage = strippedComment;
     let contextToAppend: string | undefined;
@@ -881,7 +933,7 @@ Use 'tea pr view ${String(pr.number)}' for full details if needed.`;
       }
     }
 
-    // 14. Fetch comment history for thread context
+    // 15. Fetch comment history for thread context
     const commentHistory = await this.fetchCommentHistory(owner, repo, number);
     const threadContext = commentHistory.length > 0 ? commentHistory.join('\n') : undefined;
     getLog().debug(
@@ -889,13 +941,14 @@ Use 'tea pr view ${String(pr.number)}' for full details if needed.`;
       'thread_context_loaded'
     );
 
-    // 15. Route to orchestrator with isolation hints (with lock for concurrency control)
+    // 16. Route to orchestrator with isolation hints (with lock for concurrency control)
     await this.lockManager.acquireLock(conversationId, async () => {
       try {
         await handleMessage(this, conversationId, finalMessage, {
           issueContext: contextToAppend,
           threadContext,
           isolationHints,
+          userId: archonUserId,
         });
       } catch (error) {
         const err = toError(error);

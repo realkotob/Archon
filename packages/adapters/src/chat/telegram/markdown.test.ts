@@ -1,3 +1,5 @@
+import { describe, expect, test } from 'bun:test';
+
 import { convertToTelegramMarkdown, escapeMarkdownV2, isAlreadyEscaped } from './markdown';
 
 describe('telegram-markdown', () => {
@@ -64,6 +66,24 @@ describe('telegram-markdown', () => {
         const result = convertToTelegramMarkdown(input);
         // Should have escaped . + -
         expect(result).toBeDefined();
+      });
+    });
+
+    describe('blockquotes', () => {
+      // Regression: telegramify-markdown escaped the `>` blockquote marker
+      // and double-escaped special characters on the same line, which
+      // Telegram rejected with "Character '.' is reserved and must be
+      // escaped". See coleam00/Archon#1102.
+      test('escapes special chars exactly once inside blockquotes', () => {
+        expect(convertToTelegramMarkdown('> hi.')).toBe('> hi\\.\n');
+      });
+
+      test('escapes multiple special chars exactly once on the same blockquote line', () => {
+        expect(convertToTelegramMarkdown('> a.b-c!')).toBe('> a\\.b\\-c\\!\n');
+      });
+
+      test('preserves the `>` marker on every line of a multi-line blockquote', () => {
+        expect(convertToTelegramMarkdown('> first.\n> second?')).toBe('> first\\.\n> second?\n');
       });
     });
 

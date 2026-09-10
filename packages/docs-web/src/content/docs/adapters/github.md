@@ -11,11 +11,13 @@ sidebar:
 
 Connect Archon to GitHub so you can interact with your AI coding assistant from issues and pull requests.
 
+> **Teams sharing one Archon instance:** prefer the [GitHub App setup](./github-app-setup.md). The PAT-mode setup on this page is the legacy path — it still works for solo installs, but bot comments all post under the PAT owner's avatar and tokens never auto-rotate. App mode gives you `<slug>[bot]` attribution, 1h token rotation, multi-org support, and one webhook URL.
+
 ## Prerequisites
 
-- Archon server running (see [Getting Started](/getting-started/))
+- Archon server running (see [Getting Started](/getting-started/overview/))
 - GitHub repository with issues enabled
-- `GITHUB_TOKEN` set in your environment (see [Getting Started](/getting-started/))
+- `GITHUB_TOKEN` set in your environment (see [Getting Started](/getting-started/overview/))
 - Public endpoint for webhooks (see ngrok setup below for local development)
 
 ## Step 1: Generate Webhook Secret
@@ -78,7 +80,7 @@ Go to your repository settings:
 | **Content type** | `application/json` |
 | **Secret** | Paste the secret from Step 1 |
 | **SSL verification** | Enable SSL verification (recommended) |
-| **Events** | Select "Let me select individual events":<br>- Issues<br>- Issue comments<br>- Pull requests |
+| **Events** | Select "Let me select individual events":<br>- Check runs<br>- Issues<br>- Issue comments<br>- Pull requests |
 
 Click "Add webhook" and verify it shows a green checkmark after delivery.
 
@@ -125,7 +127,7 @@ Once your server is running, add more repos by creating a webhook with the same 
 - **Payload URL**: Your server URL + `/webhooks/github`
 - **Content type**: `application/json`
 - **Secret**: Same `WEBHOOK_SECRET` from your `.env`
-- **Events**: Issues, Issue comments, Pull requests
+- **Events**: Check runs, Issues, Issue comments, Pull requests
 
 **Via CLI:**
 
@@ -138,12 +140,15 @@ gh api repos/OWNER/REPO/hooks --method POST \
   -f "config[url]=https://YOUR_DOMAIN/webhooks/github" \
   -f "config[content_type]=json" \
   -f "config[secret]=$WEBHOOK_SECRET" \
+  -f "events[]=check_run" \
   -f "events[]=issues" \
   -f "events[]=issue_comment" \
   -f "events[]=pull_request"
 ```
 
 **Important**: The webhook secret must be identical across all repos.
+
+Check-run deliveries wake CI waits quickly. They are not required for correctness: when GitHub does not deliver one, the workflow reaches its deadline and probes CI again.
 
 ## Further Reading
 

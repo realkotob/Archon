@@ -19,6 +19,9 @@ export * as codebaseDb from './codebases';
 export * as sessionDb from './sessions';
 export * as isolationEnvDb from './isolation-environments';
 export * as workflowDb from './workflows';
+export * as workflowNodeSessionDb from './workflow-node-sessions';
+export * as workflowRunNodeSessionDb from './workflow-run-node-sessions';
+export * as userDb from './users';
 
 // Also export individual functions for direct imports
 export * from './conversations';
@@ -27,3 +30,6 @@ export { SessionNotFoundError } from './sessions';
 export * from './sessions';
 export * from './isolation-environments';
 export * from './workflows';
+export * from './workflow-node-sessions';
+export * from './workflow-run-node-sessions';
+export * from './users';

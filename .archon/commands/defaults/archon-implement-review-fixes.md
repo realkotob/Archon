@@ -175,10 +175,19 @@ Must succeed.
 
 ### 4.1 Stage Changes
 
+Stage **only** the files you actually edited while applying review fixes — never `git add -A`, `git add .`, or `git add -u`. List them by name:
+
 ```bash
-git add -A
-git status
+git add path/to/file1 path/to/file2 ...
+git status --porcelain  # verify nothing scratch/review/PR-body is staged
 ```
+
+**Never stage**:
+
+- `.pr-body.md`, `pr-body.md`, `*.scratch.md`, `*.tmp.md`
+- `review/`, `*-report.md` at the repo root
+- Anything under `$ARTIFACTS_DIR` (review artifacts live here, not in the worktree)
+- Repo-local Archon telemetry: `.archon/artifacts/`, `.archon/logs/`, `.archon/state/` (local-only — never in git)
 
 ### 4.2 Commit
 

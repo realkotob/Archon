@@ -1,6 +1,6 @@
 import { mock, describe, test, expect, beforeEach, type Mock } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
-import type { MessageChunk } from '../types';
+import type { MessageChunk, SendQueryOptions } from '@archon/providers/types';
 
 // ─── Mock setup (BEFORE importing module under test) ─────────────────────────
 
@@ -27,7 +27,7 @@ const mockSendQuery = mock(async function* (): AsyncGenerator<MessageChunk> {
     prompt: string,
     cwd: string,
     resumeSessionId?: string,
-    options?: { model?: string; tools?: string[] }
+    options?: SendQueryOptions
   ) => AsyncGenerator<MessageChunk>
 >;
 
@@ -38,6 +38,10 @@ const mockGetAgentProvider = mock(() => ({
 
 mock.module('@archon/providers', () => ({
   getAgentProvider: mockGetAgentProvider,
+  getRegisteredProviders: mock(() => []),
+  // credentials/delivery (#1955) imports these from '@archon/providers'.
+  PI_PROVIDER_ENV_VARS: { anthropic: 'ANTHROPIC_API_KEY', openai: 'OPENAI_API_KEY' },
+  PI_AMBIENT_VENDORS: ['amazon-bedrock', 'google-vertex'],
 }));
 
 // ─── Import module under test (AFTER all mocks) ─────────────────────────────
@@ -175,6 +179,40 @@ describe('title-generator', () => {
       nodeConfig?: { allowed_tools?: string[] };
     };
     expect(optionsArg.nodeConfig?.allowed_tools).toEqual([]);
+  });
+
+  test('passes assistantConfig through to the provider', async () => {
+    const assistantConfig = { model: 'gpt-5.4', modelReasoningEffort: 'medium' };
+
+    await generateAndSetTitle(
+      'conv-12',
+      'Some message',
+      'codex',
+      '/tmp',
+      'figma-mcp-smoke',
+      assistantConfig
+    );
+
+    const optionsArg = mockSendQuery.mock.calls[0][3] as {
+      assistantConfig?: Record<string, unknown>;
+    };
+    expect(optionsArg.assistantConfig).toEqual(assistantConfig);
+  });
+
+  test('merges resolved requestOptions while disabling tools', async () => {
+    await generateAndSetTitle('conv-13', 'Some message', 'claude', '/tmp', undefined, undefined, {
+      model: 'haiku',
+      assistantConfig: { settingSources: ['project'] },
+      nodeConfig: { effort: 'high' },
+    });
+
+    const optionsArg = mockSendQuery.mock.calls[0][3] as SendQueryOptions;
+    expect(optionsArg.model).toBe('haiku');
+    expect(optionsArg.assistantConfig).toEqual({ settingSources: ['project'] });
+    expect(optionsArg.nodeConfig).toEqual({
+      effort: 'high',
+      allowed_tools: [],
+    });
   });
 
   test('handles double failure gracefully (AI fails + fallback DB write fails)', async () => {

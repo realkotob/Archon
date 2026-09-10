@@ -22,6 +22,10 @@
  */
 import { config } from 'dotenv';
 import { resolve } from 'path';
+import {
+  captureDetachedInstallContext,
+  restoreDetachedInstallContext,
+} from './detached-install-context';
 
 /** The four filenames Bun auto-loads from CWD (in loading order). */
 const BUN_AUTO_LOADED_ENV_FILES = ['.env', '.env.local', '.env.development', '.env.production'];
@@ -39,13 +43,24 @@ const CLAUDE_CODE_AUTH_VARS = new Set([
  * Safe to call even when no CWD .env files exist.
  */
 export function stripCwdEnv(cwd: string = process.cwd()): void {
+  const preserveDetachedInstallContext = process.argv
+    .slice(2)
+    .includes('--internal-detached-run-config');
+  const inheritedInstallContext = preserveDetachedInstallContext
+    ? captureDetachedInstallContext()
+    : undefined;
+
   // --- Pass 1: CWD .env files ---
   const cwdKeys = new Set<string>();
+  const strippedFiles: string[] = [];
 
   for (const filename of BUN_AUTO_LOADED_ENV_FILES) {
     const filepath = resolve(cwd, filename);
-    // dotenv.config with processEnv:{} parses without writing to process.env
-    const result = config({ path: filepath, processEnv: {} });
+    // dotenv.config with processEnv:{} parses without writing to process.env.
+    // quiet:true suppresses dotenv's `[dotenv@...] injecting env …` tip line —
+    // which always reports (0) here because processEnv:{} is a throwaway object
+    // and would mislead operators into thinking the file was empty (see #1302).
+    const result = config({ path: filepath, processEnv: {}, quiet: true });
     if (result.error) {
       // ENOENT is expected (file simply doesn't exist) — all others are unexpected
       const code = (result.error as NodeJS.ErrnoException).code;
@@ -55,8 +70,12 @@ export function stripCwdEnv(cwd: string = process.cwd()): void {
         );
       }
     } else if (result.parsed) {
-      for (const key of Object.keys(result.parsed)) {
-        cwdKeys.add(key);
+      const parsedKeys = Object.keys(result.parsed);
+      if (parsedKeys.length > 0) {
+        strippedFiles.push(filename);
+        for (const key of parsedKeys) {
+          cwdKeys.add(key);
+        }
       }
     }
   }
@@ -65,19 +84,24 @@ export function stripCwdEnv(cwd: string = process.cwd()): void {
     Reflect.deleteProperty(process.env, key);
   }
 
+  // A detached parent already sealed the run config with this install context.
+  // Bun's target-repo .env stripping must not delete it before CLI boot can
+  // protect it from the later Archon-owned env layers too.
+  if (inheritedInstallContext) {
+    restoreDetachedInstallContext(inheritedInstallContext);
+  }
+
+  // Tell the operator what we just did — otherwise the delete loop is silent
+  // and users think their env file was loaded (see #1302).
+  if (cwdKeys.size > 0) {
+    process.stderr.write(
+      `[archon] stripped ${cwdKeys.size} keys from ${cwd} (${strippedFiles.join(', ')}) to prevent target repo env from leaking into Archon processes\n`
+    );
+  }
+
   // --- Pass 2: Nested Claude Code session markers ---
   // Pattern-matched (not hardcoded) so new CLAUDE_CODE_* markers added by
   // future Claude Code versions are automatically handled.
-  // Emit warning BEFORE deleting — downstream code won't see CLAUDECODE=1.
-  if (process.env.CLAUDECODE === '1' && !process.env.ARCHON_SUPPRESS_NESTED_CLAUDE_WARNING) {
-    process.stderr.write(
-      '\u26a0  Detected CLAUDECODE=1 \u2014 running inside a Claude Code session.\n' +
-        '   If workflows hang silently, this is a known class of issue.\n' +
-        '   Workaround: run `archon serve` from a regular shell.\n' +
-        '   Suppress: set ARCHON_SUPPRESS_NESTED_CLAUDE_WARNING=1\n' +
-        '   Details: https://github.com/coleam00/Archon/issues/1067\n'
-    );
-  }
   if (process.env.CLAUDECODE) {
     Reflect.deleteProperty(process.env, 'CLAUDECODE');
   }
@@ -91,4 +115,15 @@ export function stripCwdEnv(cwd: string = process.cwd()): void {
   // See: https://github.com/anthropics/claude-code/issues/4619
   Reflect.deleteProperty(process.env, 'NODE_OPTIONS');
   Reflect.deleteProperty(process.env, 'VSCODE_INSPECTOR_OPTIONS');
+  // Bun inspector vars (BUN_INSPECT, BUN_INSPECT_NOTIFY, ...) injected by IDE
+  // debuggers (e.g. PyCharm's Bun plugin) make every spawned bun subprocess try
+  // to bind the parent's debug socket → EADDRINUSE crash loop (see #2030).
+  // Bun read these before user code ran, so deleting them here never detaches
+  // the CURRENT process from its debugger — it only stops the leak into children.
+  // Pattern-matched so future BUN_INSPECT_* additions are covered too.
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('BUN_INSPECT')) {
+      Reflect.deleteProperty(process.env, key);
+    }
+  }
 }

@@ -187,8 +187,7 @@ export function DashboardPage(): React.ReactElement {
     paused: 0,
   };
 
-  // Hydrate Zustand store from REST-polled data for active runs.
-  // Only sets initial state if the run isn't already tracked by SSE.
+  // Refresh the authoritative active-node snapshot while the store keeps richer SSE details.
   useEffect(() => {
     for (const run of runs) {
       if (run.status === 'running' || run.status === 'pending' || run.status === 'paused') {
@@ -196,6 +195,7 @@ export function DashboardPage(): React.ReactElement {
           runId: run.id,
           workflowName: run.workflow_name,
           status: run.status,
+          activeNodeIds: run.active_nodes,
           dagNodes: [],
           artifacts: [],
           startedAt: new Date(ensureUtc(run.started_at)).getTime(),
@@ -293,8 +293,19 @@ export function DashboardPage(): React.ReactElement {
     runAction(deleteWorkflowRun, runId, 'Failed to delete workflow run');
   const handleApprove = (runId: string): Promise<void> =>
     runAction(approveWorkflowRun, runId, 'Failed to approve workflow');
-  const handleReject = (runId: string): Promise<void> =>
-    runAction(rejectWorkflowRun, runId, 'Failed to reject workflow');
+  // Reject differs from the rest of the lifecycle actions because it takes a
+  // second argument (the optional reason). Inline it rather than squeezing
+  // through `runAction`'s `(id) => Promise` signature with a closure — keeps
+  // `runAction` usefully narrow for the single-arg actions above.
+  async function handleReject(runId: string, reason?: string): Promise<void> {
+    try {
+      setActionError(null);
+      await rejectWorkflowRun(runId, reason);
+      void queryClient.invalidateQueries({ queryKey: ['dashboardRuns'] });
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to reject workflow');
+    }
+  }
 
   const totalPages = Math.ceil(total / pageSize);
   const hasMore = page + 1 < totalPages;
@@ -364,6 +375,8 @@ export function DashboardPage(): React.ReactElement {
                           key={run.id}
                           run={run}
                           isDocker={health?.is_docker}
+                          isWsl={health?.is_wsl}
+                          wslDistro={health?.wsl_distro}
                           onCancel={handleCancel}
                           onResume={handleResume}
                           onAbandon={handleAbandon}
@@ -381,6 +394,8 @@ export function DashboardPage(): React.ReactElement {
                       parentPlatformId={group.parentPlatformId}
                       runs={group.runs}
                       isDocker={health?.is_docker}
+                      isWsl={health?.is_wsl}
+                      wslDistro={health?.wsl_distro}
                       onCancel={handleCancel}
                       onResume={handleResume}
                       onAbandon={handleAbandon}

@@ -6,14 +6,18 @@ area: workflows
 audience: [user]
 status: current
 sidebar:
-  order: 6
+  order: 7
 ---
 
-DAG workflow nodes support a `mcp` field that attaches MCP (Model Context Protocol)
-servers to individual nodes. Each node gets exactly the external tools it needs —
-GitHub, Linear, Postgres, etc. — without over-provisioning.
+DAG workflow nodes support an `mcp` field that attaches MCP (Model Context Protocol)
+servers to individual nodes. Claude workflow nodes exclude ambient user/project/plugin
+MCP by default and expose exactly the external servers in their declared file, plus
+governed native tools that Archon injects for the current workflow when applicable.
+Codex is an explicit exception: its SDK adds declared servers to ambient configuration
+rather than replacing it.
 
-**Claude only** — Codex nodes will warn and ignore the `mcp` field.
+MCP works with Claude, Codex, and Copilot workflow nodes. Pi and OpenCode nodes
+currently warn and ignore the `mcp` field.
 
 ## Quick Start
 
@@ -49,6 +53,9 @@ to the AI, and it shuts down when the node completes.
 
 MCP config files are JSON objects where each key is a server name and the value
 is a server configuration. Three transport types are supported:
+
+Archon also accepts the common wrapper format `{ "mcpServers": { ... } }`; this
+is useful when copying config from tools that already export MCP JSON.
 
 ### stdio (default)
 
@@ -119,8 +126,9 @@ Connects to an SSE endpoint.
 
 ## Environment Variable Expansion
 
-Values in `env` and `headers` fields support `$VAR_NAME` references that are
-expanded from `process.env` at execution time.
+Values in `env` and `headers` fields support `$VAR_NAME` and `${VAR_NAME}` references. They are
+expanded from Archon's process environment at execution time. Codex workflow
+nodes also include codebase-scoped env vars in that expansion.
 
 ```json
 {
@@ -128,7 +136,7 @@ expanded from `process.env` at execution time.
     "command": "npx",
     "args": ["-y", "@mcp/server-postgres"],
     "env": {
-      "DATABASE_URL": "$DATABASE_URL",
+      "DATABASE_URL": "${DATABASE_URL}",
       "POOL_SIZE": "$DB_POOL_SIZE"
     }
   }
@@ -136,7 +144,7 @@ expanded from `process.env` at execution time.
 ```
 
 **Rules:**
-- Pattern: `$UPPER_CASE_VAR` (matches `[A-Z_][A-Z0-9_]*`)
+- Pattern: `$UPPER_CASE_VAR` or `${UPPER_CASE_VAR}` (matches `[A-Z_][A-Z0-9_]*`)
 - Only `env` and `headers` values are expanded — `command`, `args`, `url` are left untouched
 - Undefined vars are replaced with empty string and a warning is shown:
   `Warning: Node 'X' MCP config references undefined env vars: VAR_NAME`
@@ -165,21 +173,28 @@ A single config file can define multiple servers:
 }
 ```
 
-## Automatic Tool Wildcards
+## Provider Tool Wiring
 
-When a node loads MCP servers, tool wildcards are automatically added to `allowedTools`.
-For servers named `github` and `postgres`, the node gets:
+Claude nodes automatically add tool wildcards to `allowed_tools`. For servers
+named `github` and `postgres`, the node gets:
 
 - `mcp__github__*`
 - `mcp__postgres__*`
 
-This means all tools from those servers are immediately available without manually
-listing them. The wildcards merge with any existing `allowed_tools` on the node.
+With no `mcp:` declaration, a Claude workflow node receives no ambient or
+author-declared MCP servers. Archon may still inject its own governed native-tool
+server for a node that requests an engine capability. This does not disable
+`CLAUDE.md`, built-in agents, or filesystem-defined agents.
+
+Codex nodes pass the same MCP config as per-node `mcp_servers` overrides to the
+Codex SDK, so the servers are available for that node without requiring global
+`~/.codex/config.toml` setup.
 
 ## MCP-Only Nodes
 
-Combine `mcp` with `allowed_tools: []` to create nodes that can only use MCP tools
-and have no access to built-in tools (Bash, Read, Write, etc.):
+For providers that support tool restrictions, combine `mcp` with
+`allowed_tools: []` to create nodes that can only use MCP tools and have no
+access to built-in tools (Bash, Read, Write, etc.):
 
 ```yaml
 nodes:
@@ -190,12 +205,15 @@ nodes:
 ```
 
 This is useful for sandboxing — the AI can only interact through the MCP server
-and cannot touch the filesystem or run shell commands.
+and cannot touch the filesystem or run shell commands. Codex currently does not
+support Archon's `allowed_tools` / `denied_tools` restrictions, so this pattern
+is enforced for Claude nodes but not Codex nodes.
 
 ## Connection Failure Handling
 
-MCP server connections are established when the node starts executing. If a server
-fails to connect, you'll see a message like:
+MCP server connections are established when the node starts executing. If a
+server the **workflow** configured via `mcp:` fails to connect, you'll see a
+message like:
 
 ```
 MCP server connection failed: github (failed)
@@ -203,6 +221,22 @@ MCP server connection failed: github (failed)
 
 The node continues executing but without the tools from the failed server.
 Check your config file path, server command, and environment variables if this happens.
+
+Claude's strict workflow configuration prevents undeclared user/plugin MCPs from
+starting, so their connection failures do not affect the run. Codex can still
+inherit ambient servers as described below.
+
+### Codex ambient MCP limitation
+
+Codex's SDK applies node `mcp:` servers as additive configuration overrides. It
+does not replace the ambient user/project/plugin MCP catalog: with no node `mcp:`,
+ambient servers may remain available, and with a declared file, both ambient and
+declared servers may be present. `mcp_servers={}` does not clear inherited entries,
+and the current SDK has no wildcard/default global-off control.
+
+Archon therefore does not describe Codex `mcp:` as an exclusive tool boundary.
+It preserves runnable additive behavior and reports the limitation rather than
+mutating user configuration or rejecting the workflow.
 
 ## Workflow Examples
 
@@ -360,8 +394,8 @@ bun run cli workflow run archon-smart-pr-review "Review PR #123"
 
 ## Limitations
 
-- **Claude only** — Codex nodes warn and ignore the `mcp` field. Configure MCP
-  servers globally in the Codex CLI config instead.
+- **Codex tool restrictions** — Codex nodes support `mcp`, but Archon's
+  `allowed_tools` / `denied_tools` restrictions are still ignored by Codex.
 - **Haiku model** — Tool search (lazy loading for many tools) is not supported on
   Haiku. You'll see a warning. Consider using Sonnet or Opus for MCP nodes.
 - **No load-time validation** — The MCP config file is read at execution time, not
@@ -378,7 +412,8 @@ bun run cli workflow run archon-smart-pr-review "Review PR #123"
 | `MCP config must be a JSON object` | Top-level value is array or string | Wrap in `{ "server-name": { ... } }` |
 | `undefined env vars: VAR_NAME` | Environment variable not set | Export the variable or add it to your `.env` |
 | `MCP server connection failed` | Server process crashed or URL unreachable | Check command/URL, test the server standalone |
-| `mcp config but uses Codex` | Node resolved to Codex provider | Set `provider: claude` on the node or switch default |
+| Plugin MCP missing from workflow output | User-level plugin MCPs are filtered out of workflow warnings | Run with `--verbose` and look for provider MCP debug logs |
+| `allowed_tools` ignored with Codex | Codex provider does not support Archon's tool restrictions yet | Do not rely on `allowed_tools: []` for Codex sandboxing |
 | `Haiku model with MCP servers` | Haiku doesn't support tool search | Use `model: sonnet` or `model: opus` instead |
 
 ## Finding MCP Servers

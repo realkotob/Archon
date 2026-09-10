@@ -1,8 +1,16 @@
+import { terminalRecordSchema } from '@archon/workflows/schemas/terminal-record';
 /**
  * Zod schemas for workflow API endpoints.
  */
 import { z } from '@hono/zod-openapi';
 import { workflowDefinitionSchema as engineWorkflowDefinitionSchema } from '@archon/workflows/schemas/workflow';
+import {
+  workflowRunSchema as engineWorkflowRunSchema,
+  workflowRunOutcomeSchema as engineWorkflowRunOutcomeSchema,
+  workflowWaitContextSchema as engineWorkflowWaitContextSchema,
+} from '@archon/workflows/schemas/workflow-run';
+import { workflowEventRowSchema } from '@archon/core/schemas/workflow-event';
+import { dashboardWorkflowRunSchema as coreDashboardWorkflowRunSchema } from '@archon/core/schemas/workflow-run';
 
 /** Workflow definition schema — derived from engine schema via direct subpath import. */
 export const workflowDefinitionSchema =
@@ -17,14 +25,25 @@ export const workflowLoadErrorSchema = z
   })
   .openapi('WorkflowLoadError');
 
-/** Workflow source — project-defined or bundled default. */
-export const workflowSourceSchema = z.enum(['project', 'bundled']).openapi('WorkflowSource');
+/**
+ * Workflow source — project-defined, bundled default, or home-scoped (global).
+ * Precedence for same-named entries: `bundled` < `global` < `project`.
+ */
+export const workflowSourceSchema = z
+  .enum(['project', 'bundled', 'global'])
+  .openapi('WorkflowSource');
 
 /** A workflow entry in the list response, including its source. */
 export const workflowListEntrySchema = z
   .object({
     workflow: workflowDefinitionSchema,
     source: workflowSourceSchema,
+    /**
+     * Non-fatal warnings raised while parsing this workflow's YAML — today, keys
+     * the engine silently drops (#2213). The workflow still loads and runs;
+     * these tell the author what was ignored. Omitted when there are none.
+     */
+    parseWarnings: z.array(z.string()).optional(),
   })
   .openapi('WorkflowListEntry');
 
@@ -32,6 +51,12 @@ export const workflowListEntrySchema = z
 export const workflowListResponseSchema = z
   .object({
     workflows: z.array(workflowListEntrySchema),
+    /**
+     * Repo-owner-curated workflow names from `.archon/config.yaml`
+     * `recommendedWorkflows`, filtered to names present in `workflows` and
+     * preserved in declared order. Empty when no project context or no key.
+     */
+    recommended: z.array(z.string()),
     errors: z.array(workflowLoadErrorSchema).optional(),
   })
   .openapi('WorkflowListResponse');
@@ -46,7 +71,7 @@ export const getWorkflowResponseSchema = z
   .openapi('GetWorkflowResponse');
 
 /** Request body for workflow definition endpoints (PUT and POST /validate). */
-const definitionBodySchema = z.object({ definition: z.record(z.unknown()) });
+const definitionBodySchema = z.object({ definition: z.record(z.string(), z.unknown()) });
 
 /** PUT /api/workflows/:name request body. */
 export const saveWorkflowBodySchema = definitionBodySchema.openapi('SaveWorkflowBody');
@@ -89,21 +114,29 @@ export const workflowRunStatusSchema = z
   .enum(['pending', 'running', 'completed', 'failed', 'cancelled', 'paused'])
   .openapi('WorkflowRunStatus');
 
-/** A workflow run record. */
-export const workflowRunSchema = z
-  .object({
-    id: z.string(),
-    workflow_name: z.string(),
-    conversation_id: z.string(),
-    parent_conversation_id: z.string().nullable(),
-    codebase_id: z.string().nullable(),
-    status: workflowRunStatusSchema,
-    user_message: z.string(),
-    metadata: z.record(z.unknown()),
+/** Workflow-authored verdict, independent from lifecycle status. */
+export const workflowRunOutcomeSchema = engineWorkflowRunOutcomeSchema
+  .nullable()
+  .openapi('WorkflowRunOutcome');
+
+/** Persisted durable-wait cursor exposed to API clients without erasing its discriminants. */
+export const workflowWaitContextSchema =
+  engineWorkflowWaitContextSchema.openapi('WorkflowWaitContext');
+
+/** Run metadata stays open-ended, but its durable-wait contract is engine-owned and typed. */
+export const workflowRunMetadataSchema = z
+  .object({ wait: workflowWaitContextSchema.optional() })
+  .catchall(z.unknown())
+  .openapi('WorkflowRunMetadata');
+
+/** A workflow run record (wire shape with ISO string dates). */
+export const workflowRunSchema = engineWorkflowRunSchema
+  .extend({
+    outcome: workflowRunOutcomeSchema,
+    metadata: workflowRunMetadataSchema,
     started_at: z.string(),
     completed_at: z.string().nullable(),
     last_activity_at: z.string().nullable(),
-    working_path: z.string().nullable(),
   })
   .openapi('WorkflowRun');
 
@@ -112,16 +145,10 @@ export const workflowRunListResponseSchema = z
   .object({ runs: z.array(workflowRunSchema) })
   .openapi('WorkflowRunListResponse');
 
-/** A workflow event record. */
-export const workflowEventSchema = z
-  .object({
-    id: z.string(),
-    workflow_run_id: z.string(),
-    event_type: z.string(),
-    step_index: z.number().nullable(),
-    step_name: z.string().nullable(),
-    data: z.record(z.unknown()),
-    created_at: z.string(),
+/** A workflow event record (wire shape). */
+export const workflowEventSchema = workflowEventRowSchema
+  .extend({
+    created_at: z.string().datetime(),
   })
   .openapi('WorkflowEvent');
 
@@ -132,6 +159,7 @@ export const workflowRunDetailSchema = z
       worker_platform_id: z.string().optional(),
       parent_platform_id: z.string().optional(),
       conversation_platform_id: z.string().nullable(),
+      terminal_record: terminalRecordSchema.nullable(),
     }),
     events: z.array(workflowEventSchema),
   })
@@ -162,19 +190,50 @@ export const rejectWorkflowRunBodySchema = z
   .object({ reason: z.string().optional() })
   .openapi('RejectWorkflowRunBody');
 
-/** Dashboard enriched workflow run (with joined codebase/conversation data). */
-export const dashboardWorkflowRunSchema = workflowRunSchema
+/**
+ * POST /api/workflows/runs/:runId/respond request body (#2707 step 2). `decision` must be
+ * one of the paused gate's declared decisions; `approve`/`reject` are sugar for the same
+ * outcome the dedicated routes above produce.
+ */
+export const respondWorkflowRunBodySchema = z
+  .object({ decision: z.string().min(1), text: z.string().optional() })
+  .openapi('RespondWorkflowRunBody');
+
+/** DELETE /api/workflows/:name/node-sessions path params. */
+export const resetWorkflowNodeSessionsParamsSchema = z
+  .object({ name: z.string().min(1) })
+  .openapi('ResetWorkflowNodeSessionsParams');
+
+/**
+ * DELETE /api/workflows/:name/node-sessions query params.
+ *
+ * `scope` and `node` narrow the deletion. Omitting `scope` wipes every scope for the
+ * workflow — a destructive cross-scope reset that requires `confirm=all-scopes`
+ * (mirrors the CLI's `--yes` guard) so it can't happen by an accidentally-dropped param.
+ */
+export const resetWorkflowNodeSessionsQuerySchema = z
+  .object({
+    scope: z.string().optional(),
+    node: z.string().optional(),
+    confirm: z.enum(['all-scopes']).optional(),
+  })
+  .openapi('ResetWorkflowNodeSessionsQuery');
+
+/** DELETE /api/workflows/:name/node-sessions response. */
+export const resetWorkflowNodeSessionsResponseSchema = z
+  .object({
+    success: z.boolean(),
+    deleted: z.number().int().nonnegative(),
+  })
+  .openapi('ResetWorkflowNodeSessionsResponse');
+
+/** Dashboard enriched workflow run (wire shape with ISO string dates). */
+export const dashboardWorkflowRunSchema = coreDashboardWorkflowRunSchema
   .extend({
-    codebase_name: z.string().nullable(),
-    platform_type: z.string().nullable(),
-    worker_platform_id: z.string().nullable(),
-    parent_platform_id: z.string().nullable(),
-    current_step_name: z.string().nullable(),
-    total_steps: z.number().nullable(),
-    current_step_status: z.enum(['running', 'completed', 'failed']).nullable(),
-    agents_completed: z.number().nullable(),
-    agents_failed: z.number().nullable(),
-    agents_total: z.number().nullable(),
+    metadata: workflowRunMetadataSchema,
+    started_at: z.string(),
+    completed_at: z.string().nullable(),
+    last_activity_at: z.string().nullable(),
   })
   .openapi('DashboardWorkflowRun');
 
@@ -195,13 +254,21 @@ export const dashboardRunsResponseSchema = z
   })
   .openapi('DashboardRunsResponse');
 
-/** POST /api/workflows/:name/run request body. */
-export const runWorkflowBodySchema = z
+/** A single artifact file listed by GET /api/runs/:runId/artifacts. */
+export const artifactFileSchema = z
   .object({
-    conversationId: z.string(),
-    message: z.string(),
+    path: z.string(),
+    size: z.number().int().nonnegative(),
+    modifiedAt: z.string(),
   })
-  .openapi('RunWorkflowBody');
+  .openapi('ArtifactFile');
+
+/** GET /api/runs/:runId/artifacts response. */
+export const listArtifactsResponseSchema = z
+  .object({
+    files: z.array(artifactFileSchema),
+  })
+  .openapi('ListArtifactsResponse');
 
 /** GET /api/dashboard/runs query params. */
 export const dashboardRunsQuerySchema = z.object({
@@ -222,4 +289,11 @@ export const workflowRunsQuerySchema = z.object({
   status: z.string().optional(),
   codebaseId: z.string().optional(),
   limit: z.string().optional(),
+  // Non-enforcing "mine" filter: 'true' restricts to the caller's own runs
+  // when an identity resolves. Default lists everything. Enum makes the boolean
+  // contract explicit (the handler treats only 'true' as on).
+  mine: z.enum(['true', 'false']).optional(),
+  // Open-work inbox (#2747): 'true' lists terminal failed runs nothing has
+  // adopted or superseded. Mutually exclusive with status/conversationId.
+  open: z.enum(['true', 'false']).optional(),
 });

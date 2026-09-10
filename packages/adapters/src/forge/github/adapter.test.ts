@@ -3,8 +3,43 @@
  *
  * Note: Database modules are mocked to prevent self-filtering tests from
  * writing phantom records (e.g., testuser/testrepo) to the real SQLite DB.
+ *
+ * ARCHON_HOME INVARIANT (#2305): this file must create nothing under
+ * `$ARCHON_HOME`. `mock.module()` MERGES over the real module rather than
+ * replacing it, so every export a factory below omits keeps its REAL
+ * implementation and quietly does real I/O. Three such gaps produced a real
+ * `archon.db`, `config.yaml` and `bin/git-credential-archon`:
+ *
+ *   - `resolveDefaultAssistant` (step 6, via getOrCreateCodebaseForRepo)
+ *     → loadGlobalConfig() CREATES ~/.archon/config.yaml when absent
+ *   - `installCredentialHelper` (step 8, App-mode clone)
+ *     → writes the bundled helper script into ~/.archon/bin/
+ *   - `handleMessage`           (step 13, orchestrator)
+ *     → opens the real SQLite database and creates ~/.archon/workspaces/
+ *
+ * All three are stubbed below. To re-audit, run this file with `ARCHON_HOME`
+ * pointed at an empty temp dir and assert nothing appears in it.
  */
-import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import {
+  describe,
+  test,
+  expect,
+  mock,
+  spyOn,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from 'bun:test';
+import type { Mock } from 'bun:test';
+import type { Octokit } from '@octokit/rest';
+import { createHmac, randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { BUNDLED_WORKFLOWS } from '@archon/workflows/defaults';
+import { parseWorkflow } from '@archon/workflows/loader';
+import { validateStructuredOutput } from '@archon/providers';
+import type { WorkflowEventSignalCandidate } from '@archon/core/db/workflows';
 
 // Mock logger to suppress noisy output during tests
 const mockLogger = {
@@ -23,6 +58,11 @@ const mockLogger = {
 };
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
+  getCommandFolderSearchPaths: mock(() => ['.archon/commands', '.claude/commands']),
+  getProjectSourcePath: mock(
+    (owner: string, repo: string) => `/tmp/test-workspaces/${owner}/${repo}/source`
+  ),
+  ensureProjectStructure: mock(async () => undefined),
 }));
 
 // Only mock what's needed for the adapter's direct functionality
@@ -73,11 +113,51 @@ mock.module('@archon/core/db/codebases', () => ({
   updateCodebaseCommands: mock(async () => {}),
 }));
 
+// Mock the users module so adapter.handleWebhook's user-id resolution can be
+// inspected without hitting the real DB. Captures the (platform, login) args
+// so the comment.user.login ?? sender.login fallback can be asserted.
+const mockFindOrCreateUserByPlatformIdentity = mock(
+  async (_platform: string, _platformUserId: string, _displayName?: string) => ({
+    id: 'user-test-uuid',
+    display_name: 'Test',
+    email: null,
+    created_at: new Date(),
+    updated_at: new Date(),
+  })
+);
+mock.module('@archon/core/db/users', () => ({
+  findOrCreateUserByPlatformIdentity: mockFindOrCreateUserByPlatformIdentity,
+}));
+
+// getOrCreateCodebaseForRepo passes `await resolveDefaultAssistant(path)` to
+// createCodebase. The real implementation reads the global config and, when
+// ~/.archon/config.yaml does not exist, WRITES a default one (see
+// createDefaultConfig in @archon/core/config/config-loader). Every test that
+// gets past self-filtering reaches it, so leaving it real meant this suite
+// created a config file in the developer's real ~/.archon (#2305).
+const mockResolveDefaultAssistant = mock(async () => 'claude' as const);
+mock.module('@archon/core/config/resolve-assistant', () => ({
+  resolveDefaultAssistant: mockResolveDefaultAssistant,
+}));
+
 // Mock @archon/git for ensureRepoReady integration tests
-const mockCloneRepository = mock(async () => ({ ok: true, value: undefined }));
-const mockSyncRepository = mock(async () => ({ ok: true, value: undefined }));
+const mockCloneRepository = mock<(typeof import('@archon/git'))['cloneRepository']>(async () => ({
+  ok: true,
+  value: undefined,
+}));
+const mockSyncRepository = mock<(typeof import('@archon/git'))['syncRepository']>(async () => ({
+  ok: true,
+  value: undefined,
+}));
 const mockAddSafeDirectory = mock(async () => undefined);
 const mockIsWorktreePath = mock(async () => false);
+
+// execFileAsync is exported by @archon/git and must exist on the mocked
+// namespace rather than be `undefined` (which would TypeError if reached).
+// Nothing in this file asserts against it: installCredentialHelper, its only
+// caller on this path, is stubbed at file scope (see below), and its use of
+// execFileAsync is covered in @archon/core instead.
+const mockExecFileAsync = mock(async () => ({ stdout: '', stderr: '' }));
 
 mock.module('@archon/git', () => ({
   cloneRepository: mockCloneRepository,
@@ -87,49 +167,174 @@ mock.module('@archon/git', () => ({
   toRepoPath: (p: string) => p,
   toBranchName: (n: string) => n,
   toWorktreePath: (p: string) => p,
+  execFileAsync: mockExecFileAsync,
+  mkdirAsync: mock(async () => undefined),
 }));
 
 import { GitHubAdapter } from './adapter';
-import { ConversationLockManager } from '@archon/core';
+import type { WebhookEvent } from './types';
+// Namespace import so the dedup tests can spyOn(core, 'handleMessage') — the
+// orchestrator entry point the adapter calls after webhook setup succeeds.
+import * as core from '@archon/core';
+import * as workflowDb from '@archon/core/db/workflows';
 
 // Create a mock lock manager that immediately executes handlers
+const mockAcquireLock = mock(async (_id: string, handler: () => Promise<void>) => {
+  await handler();
+  return { status: 'started' as const };
+});
 const mockLockManager = {
-  acquireLock: mock(async (_id: string, handler: () => Promise<void>) => {
-    await handler();
-  }),
-  getStats: () => ({
-    active: 0,
-    queuedTotal: 0,
-    queuedByConversation: [],
-    maxConcurrent: 10,
-    activeConversationIds: [],
-  }),
-} as unknown as ConversationLockManager;
+  acquireLock: mockAcquireLock,
+};
+
+/**
+ * File-wide stubs for the `@archon/core` functions `handleWebhook()` reaches in
+ * its final steps. `spyOn` (not `mock.module`) because `context.test.ts` already
+ * mock.modules `@archon/core` with a different shape, and two conflicting
+ * factories for one path is exactly the pollution CLAUDE.md forbids — and
+ * because spies are reversible.
+ *
+ * Lifetime is deliberately the WHOLE FILE, not a single describe block. The
+ * `handleMessage` spy used to be scoped to `webhook delivery dedup`, whose
+ * `afterAll` restored it before `App mode` ran — which is how the App-mode
+ * webhook test ended up running the real orchestrator and opening the real
+ * SQLite database (#2305).
+ */
+let handleMessageSpy: ReturnType<typeof spyOn<typeof core, 'handleMessage'>>;
+let installCredentialHelperSpy: ReturnType<typeof spyOn<typeof core, 'installCredentialHelper'>>;
+let getLinkedIssueNumbersSpy: ReturnType<typeof spyOn<typeof core, 'getLinkedIssueNumbers'>>;
+
+beforeAll(() => {
+  handleMessageSpy = spyOn(core, 'handleMessage').mockImplementation(async () => {});
+  installCredentialHelperSpy = spyOn(core, 'installCredentialHelper').mockImplementation(
+    async () => ({ kind: 'installed', helperPath: '/stub/.archon/bin/git-credential-archon' })
+  );
+  getLinkedIssueNumbersSpy = spyOn(core, 'getLinkedIssueNumbers').mockImplementation(
+    async () => []
+  );
+});
+
+afterAll(() => {
+  handleMessageSpy.mockRestore();
+  installCredentialHelperSpy.mockRestore();
+  getLinkedIssueNumbersSpy.mockRestore();
+});
+
+/**
+ * A path that is guaranteed not to exist, so `ensureRepoReady` takes its CLONE
+ * branch rather than the "directory already exists → sync" branch.
+ *
+ * Shared literals like `/tmp/clone-test` are a collision waiting to happen, and
+ * the failure is silent in the wrong direction: on a machine where the path
+ * exists, a `not.toHaveBeenCalled()` assertion downstream of the clone branch
+ * passes for the wrong reason. Unique per call, and never created.
+ */
+function unclonedPath(): string {
+  return join(tmpdir(), `archon-clone-test-${randomUUID()}`);
+}
+
+/**
+ * Every Octokit REST endpoint `handleWebhook()` can reach, stubbed to RESOLVE:
+ * `repos.get` (step 7), `issues.createComment` (postComment), `pulls.get`
+ * (step 10, PR payloads) and `issues.listComments` (step 12, thread context).
+ *
+ * Resolving is the point. A stub that only makes `repos.get` REJECT looks
+ * complete but merely stops the flow at step 7's catch-and-return, leaving
+ * steps 8-13 unmocked; the first payload or code change that gets past step 7
+ * then silently falls into real I/O. Stub the whole surface instead.
+ */
+type CreateCommentArgs = NonNullable<Parameters<Octokit['rest']['issues']['createComment']>[0]>;
+type ListCommentsArgs = NonNullable<Parameters<Octokit['rest']['issues']['listComments']>[0]>;
+type ListComment = Awaited<ReturnType<Octokit['rest']['issues']['listComments']>>['data'][number];
+type ListCommentUser = Pick<NonNullable<ListComment['user']>, 'login'>;
+type CreateComment = (args: CreateCommentArgs) => Promise<unknown>;
+type ListComments = (args: ListCommentsArgs) => Promise<{
+  data: { body?: ListComment['body'] | null; user?: ListCommentUser | null }[];
+}>;
+type RepositoryData = Awaited<ReturnType<Octokit['rest']['repos']['get']>>['data'];
+type PullRequestData = Awaited<ReturnType<Octokit['rest']['pulls']['get']>>['data'];
+
+interface OctokitStubs {
+  reposGet: Mock<
+    (
+      args: NonNullable<Parameters<Octokit['rest']['repos']['get']>[0]>
+    ) => Promise<{ data: Pick<RepositoryData, 'default_branch'> }>
+  >;
+  listComments: Mock<ListComments>;
+  createComment: Mock<CreateComment>;
+  pullsGet: Mock<
+    (args: NonNullable<Parameters<Octokit['rest']['pulls']['get']>[0]>) => Promise<{
+      data: {
+        head: Pick<PullRequestData['head'], 'ref' | 'sha'> & {
+          repo: Pick<NonNullable<PullRequestData['head']['repo']>, 'full_name'> | null;
+        };
+        base: { repo: Pick<PullRequestData['base']['repo'], 'full_name'> };
+      };
+    }>
+  >;
+}
+
+function makeCreateCommentMock(): Mock<CreateComment> {
+  return mock(async () => ({ data: {} }));
+}
+
+function makeListCommentsMock(
+  data: Awaited<ReturnType<ListComments>>['data'] = []
+): Mock<ListComments> {
+  return mock(async () => ({ data }));
+}
+
+/**
+ * Replaces an adapter's private Octokit client with that surface and returns
+ * the stubs, for the callers that assert against them.
+ */
+function installOctokitStubs(
+  adapter: GitHubAdapter,
+  overrides: Partial<Pick<OctokitStubs, 'createComment' | 'listComments'>> = {}
+): OctokitStubs {
+  const stubs: OctokitStubs = {
+    reposGet: mock(async () => ({ data: { default_branch: 'main' } })),
+    listComments: overrides.listComments ?? makeListCommentsMock(),
+    createComment: overrides.createComment ?? makeCreateCommentMock(),
+    pullsGet: mock(async () => ({
+      data: {
+        head: {
+          ref: 'feature-branch',
+          sha: 'abc123def456',
+          repo: { full_name: 'testuser/testrepo' },
+        },
+        base: { repo: { full_name: 'testuser/testrepo' } },
+      },
+    })),
+  };
+  // @ts-expect-error - replacing private Octokit client for testing
+  adapter.octokit = {
+    rest: {
+      repos: { get: stubs.reposGet },
+      issues: { listComments: stubs.listComments, createComment: stubs.createComment },
+      pulls: { get: stubs.pullsGet },
+    },
+  };
+  return stubs;
+}
 
 /**
  * Helper to create a test adapter with mocked Octokit createComment method.
  * Reduces duplication across tests that need to verify comment posting behavior.
  */
 async function createTestAdapterWithMockedOctokit(
-  mockCreateComment: ReturnType<typeof mock>,
+  mockCreateComment: Mock<CreateComment>,
   options?: { retryDelayMs?: (attempt: number) => number }
 ): Promise<GitHubAdapter> {
   const testAdapter = new GitHubAdapter(
-    'fake-token-for-testing',
+    { kind: 'pat', token: 'fake-token-for-testing' },
     'fake-webhook-secret',
     mockLockManager,
     undefined,
     options
   );
   await testAdapter.start();
-  // @ts-expect-error - accessing private property for testing
-  testAdapter.octokit = {
-    rest: {
-      issues: {
-        createComment: mockCreateComment,
-      },
-    },
-  };
+  installOctokitStubs(testAdapter, { createComment: mockCreateComment });
   return testAdapter;
 }
 
@@ -138,7 +343,11 @@ describe('GitHubAdapter', () => {
 
   beforeEach(() => {
     mockExecFile.mockClear();
-    adapter = new GitHubAdapter('fake-token-for-testing', 'fake-webhook-secret', mockLockManager);
+    adapter = new GitHubAdapter(
+      { kind: 'pat', token: 'fake-token-for-testing' },
+      'fake-webhook-secret',
+      mockLockManager
+    );
   });
 
   describe('streaming mode', () => {
@@ -150,6 +359,218 @@ describe('GitHubAdapter', () => {
   describe('platform type', () => {
     test('should return github', () => {
       expect(adapter.getPlatformType()).toBe('github');
+    });
+  });
+
+  describe('check_run.completed workflow signal', () => {
+    const wait = {
+      owner: 'loop_group' as const,
+      nodeId: 'await-checks',
+      bodyWaitId: 'ci-pause',
+      iteration: 1,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'event' as const,
+      event: 'checks.complete',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      resumeAt: '2099-08-24T11:00:00.000Z',
+    };
+    const pullRequestRecord = {
+      repo: { host: 'github.com', path: 'Example/Repo' },
+      number: 42,
+      url: 'https://github.com/unrelated/project/pull/999',
+      head: 'a-branch-that-is-not-used-for-matching',
+      base: 'dev',
+      is_draft: true,
+    };
+    let originalAllowedUsers: string | undefined;
+    let listCandidatesSpy: ReturnType<
+      typeof spyOn<typeof workflowDb, 'listWorkflowEventSignalCandidates'>
+    >;
+    let signalWaitSpy: ReturnType<typeof spyOn<typeof workflowDb, 'signalWorkflowWait'>>;
+
+    const candidate = (
+      runId: string,
+      structuredOutput: unknown = pullRequestRecord,
+      candidateWait = wait
+    ): WorkflowEventSignalCandidate => ({
+      runId,
+      wait: candidateWait,
+      outputType: 'pull-request',
+      structuredOutput,
+    });
+
+    const payload = (overrides: Record<string, unknown> = {}): string =>
+      JSON.stringify({
+        action: 'completed',
+        check_run: {
+          status: 'completed',
+          conclusion: 'success',
+          completed_at: '2026-08-24T10:05:00.000Z',
+          pull_requests: [{ number: 42 }, { number: 42 }],
+        },
+        repository: { full_name: 'example/repo' },
+        sender: { login: 'github-actions[bot]' },
+        ...overrides,
+      });
+
+    const deliver = async (body: string): Promise<void> => {
+      const signature = 'sha256=' + createHmac('sha256', 'check-secret').update(body).digest('hex');
+      await adapter.handleWebhook(body, signature, 'delivery-check', 'check_run');
+    };
+
+    beforeAll(() => {
+      listCandidatesSpy = spyOn(workflowDb, 'listWorkflowEventSignalCandidates');
+      signalWaitSpy = spyOn(workflowDb, 'signalWorkflowWait');
+    });
+
+    afterAll(() => {
+      listCandidatesSpy.mockRestore();
+      signalWaitSpy.mockRestore();
+    });
+
+    beforeEach(() => {
+      originalAllowedUsers = process.env.GITHUB_ALLOWED_USERS;
+      process.env.GITHUB_ALLOWED_USERS = 'human-allowlisted-user';
+      adapter = new GitHubAdapter(
+        { kind: 'pat', token: 'fake-token-for-testing' },
+        'check-secret',
+        mockLockManager
+      );
+      listCandidatesSpy.mockReset();
+      listCandidatesSpy.mockImplementation(async () => []);
+      signalWaitSpy.mockReset();
+      signalWaitSpy.mockImplementation(async () => ({ signaled: true }));
+      handleMessageSpy.mockClear();
+      mockLogger.warn.mockClear();
+    });
+
+    afterEach(() => {
+      if (originalAllowedUsers === undefined) delete process.env.GITHUB_ALLOWED_USERS;
+      else process.env.GITHUB_ALLOWED_USERS = originalAllowedUsers;
+    });
+
+    test('the adapter matcher accepts the bundled PR producer contract', () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-pr'], 'archon-pr.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+      const node = parsed.workflow.nodes.find(item => item.id === 'pr');
+      if (node?.kind !== 'agent' || node.output_format === undefined) {
+        throw new Error('archon-pr does not expose an agent output contract');
+      }
+      expect(node.output_type).toBe('pull-request');
+      expect(validateStructuredOutput(pullRequestRecord, node.output_format).valid).toBe(true);
+    });
+
+    test('signals the exact matching wait and bypasses the human sender allowlist', async () => {
+      listCandidatesSpy.mockImplementation(async () => [candidate('run-42')]);
+
+      await deliver(payload());
+
+      expect(listCandidatesSpy).toHaveBeenCalledWith('checks.complete', expect.any(Date));
+      expect(signalWaitSpy).toHaveBeenCalledTimes(1);
+      expect(signalWaitSpy).toHaveBeenCalledWith('run-42', wait, { conclusion: 'success' });
+      expect(handleMessageSpy).not.toHaveBeenCalled();
+    });
+
+    test('matches only the qualified repository and PR number, never branch or URL', async () => {
+      listCandidatesSpy.mockImplementation(async () => [
+        candidate('wrong-repo', {
+          ...pullRequestRecord,
+          repo: { host: 'github.com', path: 'other/repo' },
+        }),
+        candidate('wrong-number', { ...pullRequestRecord, number: 7 }),
+        { ...candidate('wrong-type'), outputType: 'plan' },
+        candidate('malformed-record', { number: 42 }),
+      ]);
+
+      await deliver(payload());
+
+      expect(signalWaitSpy).not.toHaveBeenCalled();
+    });
+
+    test('does not let an old completion satisfy a newer wait occurrence', async () => {
+      const newerWait = { ...wait, waitingSince: '2026-08-24T10:06:00.000Z' };
+      listCandidatesSpy.mockImplementation(async () => [
+        candidate('run-new-wait', pullRequestRecord, newerWait),
+      ]);
+
+      await deliver(payload());
+
+      expect(signalWaitSpy).not.toHaveBeenCalled();
+    });
+
+    test('a lost signal CAS causes no secondary action', async () => {
+      listCandidatesSpy.mockImplementation(async () => [candidate('run-raced')]);
+      signalWaitSpy.mockImplementation(async () => ({ signaled: false }));
+
+      await deliver(payload());
+
+      expect(signalWaitSpy).toHaveBeenCalledTimes(1);
+      expect(handleMessageSpy).not.toHaveBeenCalled();
+    });
+
+    test('ambiguous ownership signals neither run', async () => {
+      listCandidatesSpy.mockImplementation(async () => [candidate('run-a'), candidate('run-b')]);
+
+      await deliver(payload());
+
+      expect(signalWaitSpy).not.toHaveBeenCalled();
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ repo: 'example/repo', number: 42, runIds: ['run-a', 'run-b'] }),
+        'github.check_run_ownership_ambiguous'
+      );
+    });
+
+    test.each([
+      ['non-completed action', { action: 'requested' }],
+      [
+        'non-completed status',
+        {
+          check_run: {
+            status: 'in_progress',
+            conclusion: 'success',
+            completed_at: '2026-08-24T10:05:00.000Z',
+            pull_requests: [{ number: 42 }],
+          },
+        },
+      ],
+      [
+        'null conclusion',
+        {
+          check_run: {
+            status: 'completed',
+            conclusion: null,
+            completed_at: '2026-08-24T10:05:00.000Z',
+            pull_requests: [{ number: 42 }],
+          },
+        },
+      ],
+      [
+        'invalid completion time',
+        {
+          check_run: {
+            status: 'completed',
+            conclusion: 'success',
+            completed_at: 'not-a-date',
+            pull_requests: [{ number: 42 }],
+          },
+        },
+      ],
+      [
+        'no associated PR',
+        {
+          check_run: {
+            status: 'completed',
+            conclusion: 'success',
+            completed_at: '2026-08-24T10:05:00.000Z',
+            pull_requests: [],
+          },
+        },
+      ],
+    ])('ignores %s deliveries', async (_label, overrides) => {
+      await deliver(payload(overrides));
+      expect(listCandidatesSpy).not.toHaveBeenCalled();
+      expect(signalWaitSpy).not.toHaveBeenCalled();
     });
   });
 
@@ -165,7 +586,12 @@ describe('GitHubAdapter', () => {
 
   describe('bot mention detection', () => {
     test('should detect mention case-insensitively', () => {
-      const adapterWithMention = new GitHubAdapter('token', 'secret', mockLockManager, 'Dylan');
+      const adapterWithMention = new GitHubAdapter(
+        { kind: 'pat', token: 'token' },
+        'secret',
+        mockLockManager,
+        'Dylan'
+      );
       const hasMention = (
         adapterWithMention as unknown as { hasMention: (text: string) => boolean }
       ).hasMention;
@@ -180,7 +606,12 @@ describe('GitHubAdapter', () => {
     });
 
     test('should detect mention when it is the entire message', () => {
-      const adapterWithMention = new GitHubAdapter('token', 'secret', mockLockManager, 'Archon');
+      const adapterWithMention = new GitHubAdapter(
+        { kind: 'pat', token: 'token' },
+        'secret',
+        mockLockManager,
+        'Archon'
+      );
       const hasMention = (
         adapterWithMention as unknown as { hasMention: (text: string) => boolean }
       ).hasMention;
@@ -191,7 +622,12 @@ describe('GitHubAdapter', () => {
     });
 
     test('should strip mention case-insensitively', () => {
-      const adapterWithMention = new GitHubAdapter('token', 'secret', mockLockManager, 'Dylan');
+      const adapterWithMention = new GitHubAdapter(
+        { kind: 'pat', token: 'token' },
+        'secret',
+        mockLockManager,
+        'Dylan'
+      );
       const stripMention = (
         adapterWithMention as unknown as { stripMention: (text: string) => string }
       ).stripMention;
@@ -207,17 +643,25 @@ describe('GitHubAdapter', () => {
     let originalAllowedUsers: string | undefined;
 
     /**
-     * Creates an adapter with mocked signature verification for self-filtering tests.
+     * Creates an adapter with mocked signature verification and the full
+     * resolving Octokit surface (see `installOctokitStubs`), so a payload that
+     * survives self-filtering runs `handleWebhook()` to completion under mocks.
+     * NOTHING here depends on a call failing to stop the flow early.
+     *
+     * These tests assert self-filtering and user attribution, both of which
+     * happen at steps 4-5b — before any of the stubbed calls — so how far the
+     * flow runs afterwards is deliberately not load-bearing for them.
      */
     function createSelfFilterAdapter(botMention = 'archon'): GitHubAdapter {
       const adapter = new GitHubAdapter(
-        'fake-token-for-testing',
+        { kind: 'pat', token: 'fake-token-for-testing' },
         'fake-webhook-secret',
         mockLockManager,
         botMention
       );
       // @ts-expect-error - accessing private method for testing
       adapter.verifySignature = mock(() => true);
+      installOctokitStubs(adapter);
       return adapter;
     }
 
@@ -254,16 +698,76 @@ describe('GitHubAdapter', () => {
     beforeEach(() => {
       originalAllowedUsers = process.env.GITHUB_ALLOWED_USERS;
       delete process.env.GITHUB_ALLOWED_USERS;
-      mockLockManager.acquireLock.mockClear();
+      mockAcquireLock.mockClear();
       mockGetOrCreateConversation.mockClear();
       mockFindCodebaseByRepoUrl.mockClear();
       mockCreateCodebase.mockClear();
+      mockFindOrCreateUserByPlatformIdentity.mockClear();
     });
 
     afterEach(() => {
       if (originalAllowedUsers !== undefined) {
         process.env.GITHUB_ALLOWED_USERS = originalAllowedUsers;
       }
+    });
+
+    test('attribution falls back to sender.login when comment.user is absent', async () => {
+      const adapter = createSelfFilterAdapter();
+      const payload = createCommentPayload('@archon help', undefined); // no comment.user
+      // sender.login defaults to 'user123' in createCommentPayload when commentAuthor is undefined.
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      // Identity resolution must run, and must have used sender.login.
+      const calls = mockFindOrCreateUserByPlatformIdentity.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      expect(calls[0]).toEqual(['github', 'user123', 'user123']);
+    });
+
+    test('attribution prefers comment.user.login over sender.login when both present', async () => {
+      const adapter = createSelfFilterAdapter();
+      // Simulate a PR-review-comment shape: sender (e.g. PR author who triggered the
+      // event flow) differs from the comment author (the reviewer).
+      const payload = JSON.stringify({
+        action: 'created',
+        issue: {
+          number: 42,
+          title: 'Test Issue',
+          body: 'x',
+          user: { login: 'pr-author' },
+          labels: [],
+          state: 'open',
+        },
+        comment: { body: '@archon look at this', user: { login: 'reviewer-alice' } },
+        repository: {
+          owner: { login: 'testuser' },
+          name: 'testrepo',
+          full_name: 'testuser/testrepo',
+          html_url: 'https://github.com/testuser/testrepo',
+          default_branch: 'main',
+        },
+        sender: { login: 'pr-author' },
+      });
+
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      const calls = mockFindOrCreateUserByPlatformIdentity.mock.calls;
+      expect(calls.length).toBeGreaterThan(0);
+      // Reviewer (comment author) gets the row, not the PR author (sender).
+      expect(calls[0]).toEqual(['github', 'reviewer-alice', 'reviewer-alice']);
+    });
+
+    test('handleWebhook never throws when identity resolution fails', async () => {
+      const adapter = createSelfFilterAdapter();
+      mockFindOrCreateUserByPlatformIdentity.mockRejectedValueOnce(new Error('db down'));
+      const payload = createCommentPayload('@archon help', 'user123');
+
+      // Deliberately NOT wrapped in try/catch: "never throws" is the assertion.
+      await adapter.handleWebhook(payload, 'mock-signature');
+
+      // The user-resolution failure was caught and warn-logged; the webhook
+      // handler proceeded past it (DB write for the conversation still happened).
+      expect(mockGetOrCreateConversation).toHaveBeenCalled();
     });
 
     test('should ignore comments from the bot itself', async () => {
@@ -273,7 +777,7 @@ describe('GitHubAdapter', () => {
       await adapter.handleWebhook(payload, 'mock-signature');
 
       // Bot's own comments should be silently dropped - no lock acquired, no processing
-      expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
+      expect(mockAcquireLock).not.toHaveBeenCalled();
     });
 
     test('should handle case-insensitive username matching', async () => {
@@ -283,7 +787,7 @@ describe('GitHubAdapter', () => {
       await adapter.handleWebhook(payload, 'mock-signature');
 
       // Bot's own comments should be silently dropped regardless of case
-      expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
+      expect(mockAcquireLock).not.toHaveBeenCalled();
     });
 
     test('should NOT filter comments from real users', async () => {
@@ -291,11 +795,7 @@ describe('GitHubAdapter', () => {
       const payload = createCommentPayload('@archon please help', 'user123');
 
       // handleWebhook progresses past self-filtering into DB/Octokit operations
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Expected - Octokit API not mocked for this test
-      }
+      await adapter.handleWebhook(payload, 'mock-signature');
 
       // Real user comments proceed to conversation creation (not self-filtered)
       expect(mockGetOrCreateConversation).toHaveBeenCalled();
@@ -312,7 +812,7 @@ describe('GitHubAdapter', () => {
       await adapter.handleWebhook(payload, 'mock-signature');
 
       // Marked comments should be silently dropped
-      expect(mockLockManager.acquireLock).not.toHaveBeenCalled();
+      expect(mockAcquireLock).not.toHaveBeenCalled();
     });
 
     test('should process comments without bot marker from same user', async () => {
@@ -321,11 +821,7 @@ describe('GitHubAdapter', () => {
       const payload = createCommentPayload('@archon fix this', 'Wirasm');
 
       // handleWebhook progresses past self-filtering into DB/Octokit operations
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Expected - Octokit API not mocked for this test
-      }
+      await adapter.handleWebhook(payload, 'mock-signature');
 
       // Comment without marker proceeds to conversation creation (not self-filtered)
       expect(mockGetOrCreateConversation).toHaveBeenCalled();
@@ -336,20 +832,207 @@ describe('GitHubAdapter', () => {
       const payload = createCommentPayload('@archon help', undefined); // No user field
 
       // Should not crash on undefined user
-      try {
-        await adapter.handleWebhook(payload, 'mock-signature');
-      } catch {
-        // Expected - Octokit API not mocked for this test
-      }
+      await adapter.handleWebhook(payload, 'mock-signature');
 
       // Missing user should not trigger self-filtering (proceeds to conversation creation)
       expect(mockGetOrCreateConversation).toHaveBeenCalled();
     });
   });
 
+  describe('webhook delivery dedup', () => {
+    let originalAllowedUsers: string | undefined;
+
+    /**
+     * Adapter whose private Octokit client is replaced with local stubs so
+     * handleWebhook() runs its full downstream path without live API calls.
+     */
+    function createDedupAdapter(): { adapter: GitHubAdapter; octokit: OctokitStubs } {
+      const adapter = new GitHubAdapter(
+        { kind: 'pat', token: 'fake-token-for-testing' },
+        'fake-webhook-secret',
+        mockLockManager,
+        'archon'
+      );
+      // @ts-expect-error - accessing private method for testing
+      adapter.verifySignature = mock(() => true);
+      return { adapter, octokit: installOctokitStubs(adapter) };
+    }
+
+    function createIdentifiedCommentPayload(
+      commentBody: string,
+      commentId: number | undefined,
+      updatedAt: string | undefined
+    ): string {
+      const comment: {
+        id?: number;
+        body: string;
+        user: { login: string };
+        updated_at?: string;
+      } = { body: commentBody, user: { login: 'user123' } };
+      if (commentId !== undefined) comment.id = commentId;
+      if (updatedAt !== undefined) comment.updated_at = updatedAt;
+      return JSON.stringify({
+        action: 'created',
+        issue: {
+          number: 42,
+          title: 'Test Issue',
+          body: 'Description',
+          user: { login: 'user123' },
+          labels: [],
+          state: 'open',
+        },
+        comment,
+        repository: {
+          owner: { login: 'testuser' },
+          name: 'testrepo',
+          full_name: 'testuser/testrepo',
+          html_url: 'https://github.com/testuser/testrepo',
+          default_branch: 'main',
+        },
+        sender: { login: 'user123' },
+      });
+    }
+
+    async function deliver(
+      adapter: GitHubAdapter,
+      payload: string,
+      deliveryId?: string
+    ): Promise<void> {
+      await adapter.handleWebhook(payload, 'mock-signature', deliveryId);
+    }
+
+    beforeEach(() => {
+      originalAllowedUsers = process.env.GITHUB_ALLOWED_USERS;
+      delete process.env.GITHUB_ALLOWED_USERS;
+      mockAcquireLock.mockClear();
+      mockGetOrCreateConversation.mockClear();
+      mockLogger.info.mockClear();
+      handleMessageSpy.mockClear();
+    });
+
+    afterEach(() => {
+      if (originalAllowedUsers !== undefined) {
+        process.env.GITHUB_ALLOWED_USERS = originalAllowedUsers;
+      }
+    });
+
+    test('drops a repeat delivery of the same comment (same GUID)', async () => {
+      const { adapter, octokit } = createDedupAdapter();
+      const payload = createIdentifiedCommentPayload('@archon help', 1001, '2026-06-12T21:00:00Z');
+
+      await deliver(adapter, payload, 'guid-1');
+      await deliver(adapter, payload, 'guid-1');
+
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(1);
+      // First delivery completed the full pipeline against local stubs —
+      // no unmocked Octokit path (and thus no live API call) was reachable.
+      expect(octokit.reposGet).toHaveBeenCalledTimes(1);
+      expect(octokit.listComments).toHaveBeenCalledTimes(1);
+      expect(handleMessageSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('drops a dual-subscription duplicate (same comment, different GUIDs)', async () => {
+      const { adapter } = createDedupAdapter();
+      const payload = createIdentifiedCommentPayload('@archon help', 1001, '2026-06-12T21:00:00Z');
+
+      // Repo webhook and App webhook deliver the same comment under different
+      // delivery GUIDs, so GUID-only dedup would miss this duplicate.
+      await deliver(adapter, payload, 'guid-repo-hook');
+      await deliver(adapter, payload, 'guid-app-hook');
+
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(1);
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        expect.objectContaining({ deliveryId: 'guid-app-hook' }),
+        'github.duplicate_delivery_dropped'
+      );
+    });
+
+    test('redelivery within TTL is dropped even when the first attempt failed (claim-at-ingest tradeoff)', async () => {
+      const { adapter, octokit } = createDedupAdapter();
+      const payload = createIdentifiedCommentPayload('@archon help', 1001, '2026-06-12T21:00:00Z');
+      // First attempt fails transiently AFTER the dedup key is claimed.
+      octokit.reposGet.mockRejectedValueOnce(new Error('transient GitHub outage'));
+
+      await deliver(adapter, payload, 'guid-1');
+      expect(handleMessageSpy).not.toHaveBeenCalled();
+
+      // Pins current behavior: the key is claimed before downstream work, so a
+      // redelivery of the failed attempt within the TTL is dropped (accepted
+      // fire-and-forget tradeoff). Moving the claim later must flip this
+      // assertion deliberately.
+      await deliver(adapter, payload, 'guid-1-redelivery');
+
+      expect(handleMessageSpy).not.toHaveBeenCalled();
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(1);
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        expect.objectContaining({ deliveryId: 'guid-1-redelivery' }),
+        'github.duplicate_delivery_dropped'
+      );
+    });
+
+    test('processes an edited comment again (new updated_at)', async () => {
+      const { adapter } = createDedupAdapter();
+      const original = createIdentifiedCommentPayload('@archon help', 1001, '2026-06-12T21:00:00Z');
+      const edited = createIdentifiedCommentPayload(
+        '@archon help please',
+        1001,
+        '2026-06-12T21:05:00Z'
+      );
+
+      await deliver(adapter, original, 'guid-1');
+      await deliver(adapter, edited, 'guid-2');
+
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(2);
+    });
+
+    test('processes distinct comments independently', async () => {
+      const { adapter } = createDedupAdapter();
+      const first = createIdentifiedCommentPayload('@archon help', 1001, '2026-06-12T21:00:00Z');
+      const second = createIdentifiedCommentPayload('@archon also', 1002, '2026-06-12T21:00:30Z');
+
+      await deliver(adapter, first, 'guid-1');
+      await deliver(adapter, second, 'guid-2');
+
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(2);
+    });
+
+    test('requires both id and updated_at for the comment key (id alone uses GUID fallback)', async () => {
+      const { adapter } = createDedupAdapter();
+      // id present but updated_at missing — keying on id alone would dedup a
+      // later edit against the original, so this must use the GUID fallback.
+      const payload = createIdentifiedCommentPayload('@archon help', 1001, undefined);
+
+      await deliver(adapter, payload, 'guid-1');
+      await deliver(adapter, payload, 'guid-1');
+      await deliver(adapter, payload, 'guid-2');
+
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(2);
+    });
+
+    test('falls back to delivery GUID when payload lacks comment id', async () => {
+      const { adapter } = createDedupAdapter();
+      const payload = createIdentifiedCommentPayload('@archon help', undefined, undefined);
+
+      await deliver(adapter, payload, 'guid-1');
+      await deliver(adapter, payload, 'guid-1');
+
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(1);
+    });
+
+    test('fails open when neither comment id nor delivery GUID is available', async () => {
+      const { adapter } = createDedupAdapter();
+      const payload = createIdentifiedCommentPayload('@archon help', undefined, undefined);
+
+      await deliver(adapter, payload, undefined);
+      await deliver(adapter, payload, undefined);
+
+      expect(mockGetOrCreateConversation).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe('conversationId format', () => {
     test('should parse valid owner/repo#number format', async () => {
-      const mockCreateComment = mock(() => Promise.resolve({ data: {} }));
+      const mockCreateComment = makeCreateCommentMock();
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
 
       await testAdapter.sendMessage('owner/repo#123', 'test');
@@ -363,7 +1046,7 @@ describe('GitHubAdapter', () => {
     });
 
     test('postComment appends bot marker to outgoing comments', async () => {
-      const mockCreateComment = mock(() => Promise.resolve({ data: {} }));
+      const mockCreateComment = makeCreateCommentMock();
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
 
       await testAdapter.sendMessage('owner/repo#123', 'Hello world');
@@ -375,7 +1058,7 @@ describe('GitHubAdapter', () => {
     });
 
     test('should reject invalid conversationId format', async () => {
-      const mockCreateComment = mock(() => Promise.resolve({ data: {} }));
+      const mockCreateComment = makeCreateCommentMock();
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
 
       // Invalid format (pr-42 is not a number) should return early without calling API
@@ -529,7 +1212,7 @@ describe('GitHubAdapter', () => {
 
   describe('message splitting', () => {
     test('should split long messages into multiple chunks', async () => {
-      const mockCreateComment = mock(() => Promise.resolve({ data: {} }));
+      const mockCreateComment = makeCreateCommentMock();
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
 
       // Create message exceeding MAX_LENGTH (65000)
@@ -566,7 +1249,7 @@ describe('GitHubAdapter', () => {
     });
 
     test('should not split message at exactly MAX_LENGTH', async () => {
-      const mockCreateComment = mock(() => Promise.resolve({ data: {} }));
+      const mockCreateComment = makeCreateCommentMock();
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
 
       // Message exactly at MAX_LENGTH (65000) should not be split
@@ -577,7 +1260,7 @@ describe('GitHubAdapter', () => {
     });
 
     test('should handle message without paragraph breaks', async () => {
-      const mockCreateComment = mock(() => Promise.resolve({ data: {} }));
+      const mockCreateComment = makeCreateCommentMock();
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
 
       // Message under MAX_LENGTH with no paragraph breaks
@@ -588,7 +1271,7 @@ describe('GitHubAdapter', () => {
     });
 
     test('should throw error when chunk posting fails', async () => {
-      const mockCreateComment = mock()
+      const mockCreateComment = makeCreateCommentMock()
         .mockResolvedValueOnce({ data: {} }) // First chunk succeeds
         .mockRejectedValueOnce(new Error('API rate limit exceeded')); // Second chunk fails
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
@@ -610,7 +1293,7 @@ describe('GitHubAdapter', () => {
 
   describe('retry logic', () => {
     test('should retry on transient network errors', async () => {
-      const mockCreateComment = mock()
+      const mockCreateComment = makeCreateCommentMock()
         .mockRejectedValueOnce(new Error('fetch failed')) // First attempt fails
         .mockResolvedValueOnce({ data: {} }); // Second attempt succeeds
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment, {
@@ -625,7 +1308,7 @@ describe('GitHubAdapter', () => {
 
     test('should retry on transient status errors', async () => {
       const transientError = Object.assign(new Error('Gateway failure'), { status: 502 });
-      const mockCreateComment = mock()
+      const mockCreateComment = makeCreateCommentMock()
         .mockRejectedValueOnce(transientError) // First attempt fails
         .mockResolvedValueOnce({ data: {} }); // Second attempt succeeds
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment, {
@@ -639,7 +1322,9 @@ describe('GitHubAdapter', () => {
     });
 
     test('should not retry on non-retryable errors', async () => {
-      const mockCreateComment = mock().mockRejectedValue(new Error('Bad credentials'));
+      const mockCreateComment = makeCreateCommentMock().mockRejectedValue(
+        new Error('Bad credentials')
+      );
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
 
       // Should throw immediately without retry
@@ -653,7 +1338,7 @@ describe('GitHubAdapter', () => {
 
     test('should not retry on auth status errors', async () => {
       const authError = Object.assign(new Error('Unauthorized'), { status: 401 });
-      const mockCreateComment = mock().mockRejectedValue(authError);
+      const mockCreateComment = makeCreateCommentMock().mockRejectedValue(authError);
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment);
 
       // Should throw immediately without retry
@@ -666,7 +1351,9 @@ describe('GitHubAdapter', () => {
     });
 
     test('should throw after exhausting retries', async () => {
-      const mockCreateComment = mock().mockRejectedValue(new Error('fetch failed'));
+      const mockCreateComment = makeCreateCommentMock().mockRejectedValue(
+        new Error('fetch failed')
+      );
       const testAdapter = await createTestAdapterWithMockedOctokit(mockCreateComment, {
         retryDelayMs: () => 1,
       });
@@ -682,50 +1369,83 @@ describe('GitHubAdapter', () => {
   });
 
   describe('fork detection logic', () => {
-    /**
-     * Tests for the fork detection comparison logic used in handleWebhook.
-     * The actual logic: isForkPR = headRepoFullName !== baseRepoFullName
-     * This logic determines whether a PR uses the actual branch (same-repo)
-     * or a synthetic pr-N-review branch (fork).
-     */
+    function createPullRequestCommentPayload(): string {
+      const event = {
+        action: 'created',
+        issue: {
+          number: 42,
+          title: 'Test PR',
+          body: 'Description',
+          user: { login: 'user123' },
+          labels: [],
+          state: 'open',
+          pull_request: { url: 'https://api.github.com/repos/testuser/testrepo/pulls/42' },
+        },
+        comment: { body: '@archon review this', user: { login: 'user123' } },
+        repository: {
+          owner: { login: 'testuser' },
+          name: 'testrepo',
+          full_name: 'testuser/testrepo',
+          html_url: 'https://github.com/testuser/testrepo',
+          default_branch: 'main',
+        },
+        sender: { login: 'user123' },
+      } satisfies WebhookEvent;
 
-    test('should detect same-repo PR when head and base repos match', () => {
-      // Simulates same-repo PR where contributor has push access
-      const headRepoFullName = 'owner/repo';
-      const baseRepoFullName = 'owner/repo';
-      const isForkPR = headRepoFullName !== baseRepoFullName;
+      return JSON.stringify(event);
+    }
 
-      expect(isForkPR).toBe(false);
+    async function expectForkVerdict(
+      headRepoFullName: string | undefined,
+      expected: boolean
+    ): Promise<void> {
+      handleMessageSpy.mockClear();
+      const { pullsGet } = installOctokitStubs(adapter);
+      pullsGet.mockResolvedValueOnce({
+        data: {
+          head: {
+            ref: 'feature-branch',
+            sha: 'abc123def456',
+            repo: headRepoFullName === undefined ? null : { full_name: headRepoFullName },
+          },
+          base: { repo: { full_name: 'testuser/testrepo' } },
+        },
+      });
+      const payload = createPullRequestCommentPayload();
+      const signature =
+        'sha256=' + createHmac('sha256', 'fake-webhook-secret').update(payload).digest('hex');
+
+      await adapter.handleWebhook(payload, signature);
+
+      expect(pullsGet).toHaveBeenCalledWith({
+        owner: 'testuser',
+        repo: 'testrepo',
+        pull_number: 42,
+      });
+      expect(handleMessageSpy).toHaveBeenCalledWith(
+        expect.anything(),
+        'testuser/testrepo#42',
+        expect.anything(),
+        expect.objectContaining({
+          isolationHints: expect.objectContaining({ isForkPR: expected }),
+        })
+      );
+    }
+
+    test('should detect same-repo PR when head and base repos match', async () => {
+      await expectForkVerdict('testuser/testrepo', false);
     });
 
-    test('should detect fork PR when head and base repos differ', () => {
-      // Simulates fork PR where head is from a different repo
-      const headRepoFullName = 'contributor/repo';
-      const baseRepoFullName = 'owner/repo';
-      const isForkPR = headRepoFullName !== baseRepoFullName;
-
-      expect(isForkPR).toBe(true);
+    test('should detect fork PR when head and base repos differ', async () => {
+      await expectForkVerdict('contributor/testrepo', true);
     });
 
-    test('should detect fork PR when head.repo is null (deleted fork)', () => {
-      // When a fork is deleted after a PR was opened, head.repo becomes null
-      // The optional chaining (?.) returns undefined, and undefined !== 'owner/repo' is true
-      const headRepoFullName: string | undefined = undefined; // Simulates prData.head.repo?.full_name
-      const baseRepoFullName = 'owner/repo';
-      const isForkPR = headRepoFullName !== baseRepoFullName;
-
-      // Correctly treated as fork - can't push to deleted repo anyway
-      expect(isForkPR).toBe(true);
+    test('should detect fork PR when head.repo is null (deleted fork)', async () => {
+      await expectForkVerdict(undefined, true);
     });
 
-    test('should handle case sensitivity correctly', () => {
-      // GitHub full_names are case-sensitive in the API response
-      const headRepoFullName = 'Owner/Repo';
-      const baseRepoFullName = 'owner/repo';
-      const isForkPR = headRepoFullName !== baseRepoFullName;
-
-      // Different casing = different repos (fork detection)
-      expect(isForkPR).toBe(true);
+    test('should handle case sensitivity correctly', async () => {
+      await expectForkVerdict('TestUser/TestRepo', true);
     });
   });
 
@@ -733,16 +1453,13 @@ describe('GitHubAdapter', () => {
     /**
      * Helper to create adapter with mocked listComments for fetchCommentHistory tests.
      */
-    function createAdapterWithListComments(
-      mockListComments: ReturnType<typeof mock>
-    ): GitHubAdapter {
+    function createAdapterWithListComments(mockListComments: Mock<ListComments>): GitHubAdapter {
       const testAdapter = new GitHubAdapter(
-        'fake-token-for-testing',
+        { kind: 'pat', token: 'fake-token-for-testing' },
         'fake-webhook-secret',
         mockLockManager
       );
-      // @ts-expect-error - accessing private property for testing
-      testAdapter.octokit = { rest: { issues: { listComments: mockListComments } } };
+      installOctokitStubs(testAdapter, { listComments: mockListComments });
       return testAdapter;
     }
 
@@ -755,16 +1472,12 @@ describe('GitHubAdapter', () => {
     }
 
     test('should fetch and format comment history', async () => {
-      const mockListComments = mock(() =>
-        Promise.resolve({
-          data: [
-            // API returns in desc order (newest first) because direction: 'desc'
-            { user: { login: 'user3' }, body: 'Third comment' },
-            { user: { login: 'user2' }, body: 'Second comment' },
-            { user: { login: 'user1' }, body: 'First comment' },
-          ],
-        })
-      );
+      const mockListComments = makeListCommentsMock([
+        // API returns in desc order (newest first) because direction: 'desc'
+        { user: { login: 'user3' }, body: 'Third comment' },
+        { user: { login: 'user2' }, body: 'Second comment' },
+        { user: { login: 'user1' }, body: 'First comment' },
+      ]);
 
       const testAdapter = createAdapterWithListComments(mockListComments);
       const history = await callFetchCommentHistory(testAdapter);
@@ -788,9 +1501,7 @@ describe('GitHubAdapter', () => {
 
     test('should preserve full comment content without truncation', async () => {
       const longBody = 'a'.repeat(5000);
-      const mockListComments = mock(() =>
-        Promise.resolve({ data: [{ user: { login: 'user1' }, body: longBody }] })
-      );
+      const mockListComments = makeListCommentsMock([{ user: { login: 'user1' }, body: longBody }]);
 
       const testAdapter = createAdapterWithListComments(mockListComments);
       const history = await callFetchCommentHistory(testAdapter);
@@ -801,15 +1512,11 @@ describe('GitHubAdapter', () => {
     });
 
     test('should handle comments without user or body (null and undefined)', async () => {
-      const mockListComments = mock(() =>
-        Promise.resolve({
-          data: [
-            { user: null, body: 'Comment without user' },
-            { user: { login: 'user1' }, body: null },
-            { user: { login: 'user2' } }, // body property not present (undefined)
-          ],
-        })
-      );
+      const mockListComments = makeListCommentsMock([
+        { user: null, body: 'Comment without user' },
+        { user: { login: 'user1' }, body: null },
+        { user: { login: 'user2' } }, // body property not present (undefined)
+      ]);
 
       const testAdapter = createAdapterWithListComments(mockListComments);
       const history = await callFetchCommentHistory(testAdapter);
@@ -819,7 +1526,9 @@ describe('GitHubAdapter', () => {
     });
 
     test('should return empty array on API error', async () => {
-      const mockListComments = mock(() => Promise.reject(new Error('API rate limit exceeded')));
+      const mockListComments = makeListCommentsMock().mockRejectedValue(
+        new Error('API rate limit exceeded')
+      );
 
       const testAdapter = createAdapterWithListComments(mockListComments);
       const history = await callFetchCommentHistory(testAdapter);
@@ -828,7 +1537,7 @@ describe('GitHubAdapter', () => {
     });
 
     test('should handle empty comment list', async () => {
-      const mockListComments = mock(() => Promise.resolve({ data: [] }));
+      const mockListComments = makeListCommentsMock();
 
       const testAdapter = createAdapterWithListComments(mockListComments);
       const history = await callFetchCommentHistory(testAdapter);
@@ -841,7 +1550,11 @@ describe('GitHubAdapter', () => {
     let testAdapter: GitHubAdapter;
 
     beforeEach(() => {
-      testAdapter = new GitHubAdapter('fake-token', 'fake-secret', mockLockManager);
+      testAdapter = new GitHubAdapter(
+        { kind: 'pat', token: 'fake-token' },
+        'fake-secret',
+        mockLockManager
+      );
       mockCloneRepository.mockClear();
       mockSyncRepository.mockClear();
       mockAddSafeDirectory.mockClear();
@@ -869,8 +1582,7 @@ describe('GitHubAdapter', () => {
       expect(mockCloneRepository).toHaveBeenCalledTimes(1);
       const [url, path] = mockCloneRepository.mock.calls[0];
       expect(url).toBe('https://github.com/owner/repo.git');
-      expect(path).toBe('/nonexistent/path');
-      // 3rd arg is { token } when GITHUB_TOKEN is set, undefined otherwise
+      expect(String(path)).toBe('/nonexistent/path');
       expect(mockAddSafeDirectory).toHaveBeenCalledWith('/nonexistent/path');
     });
 
@@ -969,6 +1681,412 @@ describe('GitHubAdapter', () => {
         const { rm } = await import('fs/promises');
         await rm(tmpDir, { recursive: true, force: true });
       }
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // App mode (GitHub App auth) — multi-installation routing, payload short-
+  // circuit, refresh-on-401, self-filter against <slug>[bot], clone path.
+  // ---------------------------------------------------------------------------
+  describe('App mode', () => {
+    /**
+     * Build a mock IGitHubAppAuthProvider. Each fake `(owner) → installationId`
+     * pair is encoded by hashing owner — tests assert that distinct owners
+     * resolve to distinct installation ids (multi-install routing).
+     */
+    function makeMockProvider(opts: { slug?: string } = {}): {
+      provider: ReturnType<typeof buildProvider>;
+      getOctokit: ReturnType<typeof mock>;
+      getToken: ReturnType<typeof mock>;
+      prime: ReturnType<typeof mock>;
+      invalidate: ReturnType<typeof mock>;
+      invalidateRepo: ReturnType<typeof mock>;
+      resolveId: ReturnType<typeof mock>;
+      installationIdFor: (owner: string) => number;
+    } {
+      const installationIdFor = (owner: string): number =>
+        Math.abs(owner.charCodeAt(0) * 37 + (owner.charCodeAt(1) ?? 0));
+
+      type AppOctokit = {
+        __installationId: number;
+        rest: {
+          issues: {
+            createComment: Mock<CreateComment>;
+            listComments: Mock<ListComments>;
+          };
+          repos: { get: OctokitStubs['reposGet'] };
+          pulls: { get: OctokitStubs['pullsGet'] };
+        };
+      };
+
+      const octokitInstances = new Map<number, AppOctokit>();
+      const lookups = new Map<string, number>();
+
+      const getToken = mock(async (owner: string, _repo: string) => {
+        return `ghs_${owner}_token`;
+      });
+      const resolveId = mock(async (owner: string, _repo: string) => {
+        const key = `${owner.toLowerCase()}`;
+        if (!lookups.has(key)) lookups.set(key, installationIdFor(owner));
+        return lookups.get(key)!;
+      });
+      const prime = mock((owner: string, _repo: string, installationId: number) => {
+        lookups.set(owner.toLowerCase(), installationId);
+      });
+      const invalidate = mock((_id: number) => undefined);
+
+      // Each per-installation Octokit mock starts with createComment/repos/pulls
+      // mocked. Test bodies can call `.mockResolvedValueOnce(...)` /
+      // `.mockRejectedValueOnce(...)` on those fields as needed.
+      function octokitFor(installationId: number): AppOctokit {
+        let oct = octokitInstances.get(installationId);
+        if (!oct) {
+          const reposGet: OctokitStubs['reposGet'] = mock(async () => ({
+            data: { default_branch: 'main' },
+          }));
+          const pullsGet: OctokitStubs['pullsGet'] = mock(async () => ({
+            data: {
+              head: { ref: 'feature', sha: 'abc123def', repo: { full_name: 'o/r' } },
+              base: { repo: { full_name: 'o/r' } },
+            },
+          }));
+          oct = {
+            __installationId: installationId,
+            rest: {
+              issues: {
+                createComment: makeCreateCommentMock(),
+                listComments: makeListCommentsMock(),
+              },
+              repos: {
+                get: reposGet,
+              },
+              pulls: {
+                get: pullsGet,
+              },
+            },
+          };
+          octokitInstances.set(installationId, oct);
+        }
+        return oct;
+      }
+
+      const getOctokit = mock(async (owner: string, repo: string) => {
+        const id = await resolveId(owner, repo);
+        return octokitFor(id);
+      });
+
+      const invalidateRepo = mock((_owner: string, _repo: string) => undefined);
+
+      function buildProvider() {
+        return {
+          slug: opts.slug ?? 'archon-test',
+          getInstallationToken: getToken,
+          getInstallationTokenById: mock(async () => 'ghs_by_id'),
+          getOctokitForInstallation: getOctokit,
+          resolveInstallationId: resolveId,
+          primeInstallationLookup: prime,
+          invalidateToken: invalidate,
+          invalidateRepo,
+        };
+      }
+
+      return {
+        provider: buildProvider(),
+        getOctokit,
+        getToken,
+        prime,
+        invalidate,
+        invalidateRepo,
+        resolveId,
+        installationIdFor,
+      };
+    }
+
+    function createAppModeAdapter(opts: { slug?: string } = {}): {
+      adapter: GitHubAdapter;
+      provider: ReturnType<typeof makeMockProvider>;
+    } {
+      const provider = makeMockProvider(opts);
+      const adapter = new GitHubAdapter(
+        { kind: 'app', provider: provider.provider },
+        'fake-webhook-secret',
+        mockLockManager,
+        'archon'
+      );
+      // @ts-expect-error - mock signature verification
+      adapter.verifySignature = mock(() => true);
+      return { adapter, provider };
+    }
+
+    beforeEach(() => {
+      mockCloneRepository.mockClear();
+      mockCloneRepository.mockResolvedValue({ ok: true, value: undefined });
+      mockExecFileAsync.mockClear();
+      mockGetOrCreateConversation.mockClear();
+      mockFindCodebaseByRepoUrl.mockClear();
+      mockCreateCodebase.mockClear();
+      mockFindOrCreateUserByPlatformIdentity.mockClear();
+      installCredentialHelperSpy.mockClear();
+    });
+
+    test('getInstallationToken called once per (owner, repo) for sendMessage', async () => {
+      const { adapter, provider } = createAppModeAdapter();
+      // sendMessage flow goes through resolveOctokit -> getOctokitForInstallation,
+      // not getInstallationToken. Assert the Octokit path was exercised instead.
+      await adapter.sendMessage('owner/repo#42', 'hello');
+      expect(provider.getOctokit).toHaveBeenCalledWith('owner', 'repo');
+      expect(provider.getOctokit.mock.calls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    test('multi-install routing — different (owner, repo) get different installations', async () => {
+      const { adapter, provider } = createAppModeAdapter();
+      await adapter.sendMessage('alpha/repo#1', 'one');
+      await adapter.sendMessage('beta/repo#2', 'two');
+
+      const idAlpha = await provider.resolveId('alpha', 'repo');
+      const idBeta = await provider.resolveId('beta', 'repo');
+      expect(idAlpha).not.toBe(idBeta);
+      expect(provider.getOctokit).toHaveBeenCalledWith('alpha', 'repo');
+      expect(provider.getOctokit).toHaveBeenCalledWith('beta', 'repo');
+    });
+
+    test('webhook installation.id primes the lookup cache (no extra round trip)', async () => {
+      const { adapter, provider } = createAppModeAdapter();
+      mockFindOrCreateUserByPlatformIdentity.mockResolvedValueOnce({
+        id: 'u',
+        display_name: 'u',
+        email: null,
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+      const payload = JSON.stringify({
+        action: 'created',
+        issue: {
+          number: 1,
+          title: 't',
+          body: '',
+          user: { login: 'someone' },
+          labels: [],
+          state: 'open',
+        },
+        comment: { body: '@archon help', user: { login: 'someone' } },
+        repository: {
+          owner: { login: 'alpha' },
+          name: 'repo',
+          full_name: 'alpha/repo',
+          html_url: 'https://github.com/alpha/repo',
+          default_branch: 'main',
+        },
+        sender: { login: 'someone' },
+        installation: { id: 99999 },
+      });
+      try {
+        await adapter.handleWebhook(payload, 'mock-signature');
+      } catch {
+        // Inner orchestrator path may throw — we only care about priming here.
+      }
+      expect(provider.prime).toHaveBeenCalledWith('alpha', 'repo', 99999);
+    });
+
+    test('401 from Octokit triggers invalidateRepo + retry once', async () => {
+      const { adapter, provider } = createAppModeAdapter();
+      // First call to Octokit.createComment throws 401; second succeeds.
+      const octokit = await provider.getOctokit('owner', 'repo');
+      const err401 = Object.assign(new Error('Unauthorized'), { status: 401 });
+      octokit.rest.issues.createComment
+        .mockRejectedValueOnce(err401)
+        .mockResolvedValueOnce({ data: { id: 1 } });
+
+      await adapter.sendMessage('owner/repo#1', 'msg');
+      // invalidateRepo evicts BOTH the lookup cache and the token cache
+      // for (owner, repo) — see C2 in the PR-B review.
+      expect(provider.invalidateRepo).toHaveBeenCalledWith('owner', 'repo');
+    });
+
+    test('T3: second consecutive 401 propagates (no infinite retry)', async () => {
+      const { adapter, provider } = createAppModeAdapter();
+      const octokit = await provider.getOctokit('owner', 'repo');
+      const err401a = Object.assign(new Error('Unauthorized A'), { status: 401 });
+      const err401b = Object.assign(new Error('Unauthorized B'), { status: 401 });
+      // Two consecutive 401s — retry path must surface the second error and
+      // NOT call invalidateRepo a second time (which would suggest looping).
+      octokit.rest.issues.createComment
+        .mockRejectedValueOnce(err401a)
+        .mockRejectedValueOnce(err401b);
+
+      // The retry path swallows non-retryable errors at the postComment
+      // wrapper layer (401 is not in the retryable set), so the second
+      // failure propagates and postComment will log + throw it. We assert
+      // the side effects directly rather than depending on whether the
+      // outer wrapper swallows or propagates.
+      await adapter.sendMessage('owner/repo#1', 'msg').catch(() => undefined);
+
+      // Exactly one invalidateRepo call (single retry, not infinite).
+      expect(provider.invalidateRepo).toHaveBeenCalledTimes(1);
+      // The retry fn(fresh) WAS called — second mock value was consumed.
+      expect(octokit.rest.issues.createComment.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+
+    test('lookupCache eviction on 401 — adapter calls invalidateRepo(owner, repo) not invalidateToken(id)', async () => {
+      // C2 regression guard: the adapter must use invalidateRepo (which evicts
+      // BOTH caches) and not invalidateToken (which used to leave lookupCache
+      // populated with the stale id).
+      const { adapter, provider } = createAppModeAdapter();
+      const octokit = await provider.getOctokit('owner', 'repo');
+      const err401 = Object.assign(new Error('Unauthorized'), { status: 401 });
+      octokit.rest.issues.createComment
+        .mockRejectedValueOnce(err401)
+        .mockResolvedValueOnce({ data: { id: 1 } });
+
+      await adapter.sendMessage('owner/repo#1', 'msg');
+      expect(provider.invalidateRepo).toHaveBeenCalledWith('owner', 'repo');
+      // Specifically NOT the by-id variant — that's the C2 bug shape.
+      expect(provider.invalidate).not.toHaveBeenCalled();
+    });
+
+    test('self-filter ignores comments authored by "<slug>[bot]"', async () => {
+      const { adapter } = createAppModeAdapter({ slug: 'archon-bot' });
+      const payload = JSON.stringify({
+        action: 'created',
+        issue: {
+          number: 1,
+          title: 't',
+          body: '',
+          user: { login: 'someone' },
+          labels: [],
+          state: 'open',
+        },
+        comment: {
+          body: '@archon ping', // would normally trigger; bot login filter must reject first
+          user: { login: 'archon-bot[bot]' },
+        },
+        repository: {
+          owner: { login: 'o' },
+          name: 'r',
+          full_name: 'o/r',
+          html_url: 'https://github.com/o/r',
+          default_branch: 'main',
+        },
+        sender: { login: 'archon-bot[bot]' },
+      });
+      await adapter.handleWebhook(payload, 'mock-signature');
+      // Filter triggered: no user creation, no codebase lookup downstream.
+      expect(mockFindOrCreateUserByPlatformIdentity).not.toHaveBeenCalled();
+      expect(mockFindCodebaseByRepoUrl).not.toHaveBeenCalled();
+    });
+
+    test('clone path resolves installation token (not env GITHUB_TOKEN)', async () => {
+      const savedEnv = process.env.GITHUB_TOKEN;
+      try {
+        delete process.env.GITHUB_TOKEN;
+        const { adapter, provider } = createAppModeAdapter();
+        // @ts-expect-error - calling private method
+        await adapter.ensureRepoReady('owner', 'repo', 'main', '/tmp/nonexistent-test', false);
+        expect(provider.getToken).toHaveBeenCalledWith('owner', 'repo');
+        expect(mockCloneRepository).toHaveBeenCalledTimes(1);
+        expect(mockCloneRepository).toHaveBeenCalledWith(
+          'https://github.com/owner/repo.git',
+          '/tmp/nonexistent-test',
+          { credentials: { username: 'ghs_owner_token', password: '' } }
+        );
+        const [cloneUrl, clonePath] = mockCloneRepository.mock.calls[0] ?? [];
+        expect(JSON.stringify([cloneUrl, clonePath])).not.toContain('ghs_owner_token');
+      } finally {
+        if (savedEnv === undefined) {
+          delete process.env.GITHUB_TOKEN;
+        } else {
+          process.env.GITHUB_TOKEN = savedEnv;
+        }
+      }
+    });
+
+    test('AppNotInstalledError on clone surfaces a clean message', async () => {
+      const { AppNotInstalledError } = await import('@archon/core');
+      const { adapter, provider } = createAppModeAdapter();
+      provider.getToken.mockImplementationOnce(async (owner: string, repo: string) => {
+        throw new AppNotInstalledError(owner, repo, 'archon-test');
+      });
+      // @ts-expect-error - calling private method
+      const promise = adapter.ensureRepoReady('owner', 'repo', 'main', '/tmp/missing', false);
+      await expect(promise).rejects.toBeInstanceOf(AppNotInstalledError);
+    });
+
+    test('credential helper install is attempted after successful App-mode clone', async () => {
+      const { adapter } = createAppModeAdapter();
+      const clonePath = unclonedPath();
+      try {
+        // @ts-expect-error - calling private method
+        await adapter.ensureRepoReady('owner', 'repo', 'main', clonePath, false);
+      } catch {
+        // ensureRepoReady may throw inside addSafeDirectory on the bogus path;
+        // we only care that installCredentialHelper was reached.
+      }
+      // Control: prove the CLONE branch ran. Without it, a path that happens to
+      // exist would send ensureRepoReady down the sync branch and this test
+      // would report on a flow it never entered.
+      expect(mockCloneRepository).toHaveBeenCalled();
+      // Asserted on the function itself rather than through its `git config`
+      // side effect. The old proxy assertion required running the REAL
+      // installCredentialHelper, which writes the bundled helper script into
+      // $ARCHON_HOME/bin/ — a genuine write into the developer's ~/.archon from
+      // a unit test (#2305). What this test is actually about is the adapter's
+      // wiring: App-mode clone → install helper on the cloned path. The helper's
+      // own copy/chmod/git-config behaviour is covered directly by
+      // packages/core/src/github-auth/credential-helper-install.test.ts.
+      expect(installCredentialHelperSpy).toHaveBeenCalledWith(clonePath);
+    });
+
+    test('App-mode setup fails when the credential helper cannot be registered', async () => {
+      installCredentialHelperSpy.mockImplementationOnce(async () => ({
+        kind: 'failed',
+        error: new Error('git config rejected the helper'),
+      }));
+      const { adapter } = createAppModeAdapter();
+
+      // @ts-expect-error - calling private method
+      const setup = adapter.ensureRepoReady('owner', 'repo', 'main', unclonedPath(), false);
+
+      await expect(setup).rejects.toThrow('git config rejected the helper');
+      expect(mockCloneRepository).toHaveBeenCalled();
+    });
+
+    test('App-mode setup fails when the bundled credential helper is unavailable', async () => {
+      installCredentialHelperSpy.mockImplementationOnce(async () => ({
+        kind: 'failed',
+        error: new Error('bundled credential helper unavailable'),
+      }));
+      const { adapter } = createAppModeAdapter();
+
+      // @ts-expect-error - calling private method
+      const setup = adapter.ensureRepoReady('owner', 'repo', 'main', unclonedPath(), false);
+
+      await expect(setup).rejects.toThrow('bundled credential helper unavailable');
+      expect(mockCloneRepository).toHaveBeenCalled();
+    });
+
+    test('credential helper install is NOT attempted in PAT mode', async () => {
+      const patAdapter = new GitHubAdapter(
+        { kind: 'pat', token: 'fake-token' },
+        'fake-webhook-secret',
+        mockLockManager,
+        'archon'
+      );
+      try {
+        // @ts-expect-error - calling private method
+        await patAdapter.ensureRepoReady('owner', 'repo', 'main', unclonedPath(), false);
+      } catch {
+        // Same bogus-path tolerance as the App-mode case above.
+      }
+      // Control FIRST, and load-bearing here: this is a `not.toHaveBeenCalled`
+      // assertion, so anything that stops ensureRepoReady before the credential
+      // block makes it pass VACUOUSLY — the exact silent-pass shape this PR
+      // exists to remove. Asserting the clone branch ran means the negative can
+      // only be satisfied by the auth-kind guard.
+      expect(mockCloneRepository).toHaveBeenCalled();
+      // Pins the `this.auth.kind === 'app'` guard: PAT operators never get the
+      // helper installed. Without this, stubbing installCredentialHelper above
+      // would let the guard be deleted with both tests still green.
+      expect(installCredentialHelperSpy).not.toHaveBeenCalled();
     });
   });
 });

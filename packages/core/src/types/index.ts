@@ -1,12 +1,26 @@
 /**
  * Core type definitions for the Remote Coding Agent platform
  */
-import type { TransitionTrigger } from '../state/session-transitions';
-import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
-import { z } from 'zod';
+import type { ResolvedWorkflow } from '@archon/workflows/schemas/workflow';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { RunModelOverrides } from '@archon/workflows/model-validation';
+import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 
-// MessageChunk imported for use in IPlatformAdapter/IWebPlatformAdapter below
-import type { MessageChunk } from '@archon/providers/types';
+// MessageChunk + TokenUsage are used by IPlatformAdapter below.
+import type { MessageChunk, TokenUsage } from '@archon/providers/types';
+
+// Re-export schema-derived types so existing imports from '@archon/core/types' keep working.
+export type {
+  Conversation,
+  IdentityPlatform,
+  User,
+  UserIdentity,
+  UserRole,
+  Codebase,
+  Session,
+  SessionMetadata,
+} from '../schemas';
+export { sessionMetadataSchema, identityPlatformSchema } from '../schemas';
 
 /**
  * Custom error for when a conversation is not found during update operations
@@ -17,22 +31,6 @@ export class ConversationNotFoundError extends Error {
     super(`Conversation not found: ${conversationId}`);
     this.name = 'ConversationNotFoundError';
   }
-}
-
-export interface Conversation {
-  id: string;
-  platform_type: string;
-  platform_conversation_id: string;
-  codebase_id: string | null;
-  cwd: string | null;
-  isolation_env_id: string | null; // UUID FK to isolation_environments
-  ai_assistant_type: string;
-  title: string | null;
-  hidden: boolean;
-  deleted_at: Date | null;
-  last_activity_at: Date | null; // For staleness detection
-  created_at: Date;
-  updated_at: Date;
 }
 
 import type { IsolationHints } from '@archon/isolation';
@@ -51,41 +49,35 @@ export interface HandleMessageContext {
   readonly parentConversationId?: string;
   readonly isolationHints?: IsolationHints;
   readonly attachedFiles?: AttachedFile[];
-}
-
-export interface Codebase {
-  id: string;
-  name: string;
-  repository_url: string | null;
-  default_cwd: string;
-  ai_assistant_type: string;
-  commands: Record<string, { path: string; description: string }>;
-  created_at: Date;
-  updated_at: Date;
-}
-
-export const sessionMetadataSchema = z
-  .object({
-    lastCommand: z.string().optional(),
-  })
-  .passthrough();
-
-export type SessionMetadata = z.infer<typeof sessionMetadataSchema>;
-
-export interface Session {
-  id: string;
-  conversation_id: string;
-  codebase_id: string | null;
-  ai_assistant_type: string;
-  assistant_session_id: string | null;
-  active: boolean;
-  metadata: SessionMetadata;
-  started_at: Date;
-  ended_at: Date | null;
-  // Audit trail fields (added in migration 010)
-  parent_session_id: string | null;
-  transition_reason: TransitionTrigger | null;
-  ended_reason: TransitionTrigger | null;
+  /**
+   * Archon user UUID resolved from the inbound platform user identifier.
+   * Chat/forge adapters resolve this via findOrCreateUserByPlatformIdentity
+   * before calling handleMessage. Undefined for web/CLI surfaces until their
+   * own auth flows are wired.
+   */
+  readonly userId?: string;
+  /**
+   * Declared workflow inputs supplied by the caller (#2554), keyed by input name.
+   *
+   * Set ONLY by the `POST /api/workflows/:name/run` route, whose body carries an
+   * `inputs` map. It rides the context rather than the message text so a supplied value
+   * is never confused with `$ARGUMENTS`, and so chat platforms — which have no channel
+   * for it and never populate this field — keep their existing behaviour unchanged
+   * (#2555 tracks giving them one).
+   */
+  readonly workflowInputs?: Readonly<Record<string, string>>;
+  /** Sparse tier/@alias rebindings supplied by the workflow run route (#2481). */
+  readonly workflowModelOverrides?: RunModelOverrides;
+  /** Validated inline config content supplied by the workflow run route. */
+  readonly workflowRunConfig?: WorkflowRunConfigInput;
+  /**
+   * Between-run continuation (#2747): the terminal run this run adopts or
+   * supersedes. Rides the context like `workflowInputs` so it can never be
+   * confused with message text. Provenance is recorded engine-side; lane
+   * resolution is the dispatching surface's job.
+   */
+  readonly workflowAdoptRunId?: string;
+  readonly workflowSupersedesRunId?: string;
 }
 
 export interface CommandResult {
@@ -94,8 +86,20 @@ export interface CommandResult {
   modified?: boolean; // Indicates if conversation state was modified
   workflow?: {
     // If set, orchestrator should execute this workflow
-    definition: WorkflowDefinition;
+    definition: ResolvedWorkflow;
     args: string;
+    force?: boolean;
+    resumeRunId?: string;
+    resumeRun?: WorkflowRun;
+    /**
+     * The continuation graph already resolved from that run's recorded source.
+     *
+     * Carried so dispatch does not repeat the digest verification and discovery the
+     * handler just paid for. A value, not a flag: it cannot claim work it did not do.
+     */
+    resolvedContinuation?: ResolvedWorkflow;
+    /** Keys the engine dropped from this workflow's YAML (#2213). */
+    parseWarnings?: readonly string[];
   };
 }
 
@@ -160,6 +164,18 @@ export interface IPlatformAdapter {
 
   /** Retract previously streamed text (used when workflow routing intercepts) */
   emitRetract?(conversationId: string): Promise<void>;
+
+  /**
+   * Optional: Append a small footer summarising cost / token usage / stop reason
+   * after a direct-chat assistant turn. Implemented by adapters that surface
+   * usage info in-band (e.g. Slack posts an italic context line). No-op for
+   * adapters that don't care; orchestrator skips the call when both `cost`
+   * and `tokens` are absent.
+   */
+  sendResultFooter?(
+    conversationId: string,
+    info: { cost?: number; tokens?: TokenUsage; stopReason?: string }
+  ): Promise<void>;
 }
 
 /**
@@ -186,9 +202,5 @@ export function isWebAdapter(adapter: IPlatformAdapter): adapter is IWebPlatform
 // Re-export workflow schema types for config-types.ts compatibility
 import type { ModelReasoningEffort, WebSearchMode } from '@archon/workflows/schemas/workflow';
 export type { ModelReasoningEffort, WebSearchMode };
-import type {
-  EffortLevel,
-  ThinkingConfig,
-  SandboxSettings,
-} from '@archon/workflows/schemas/dag-node';
-export type { EffortLevel, ThinkingConfig, SandboxSettings };
+import type { EffortLevel, SandboxSettings } from '@archon/workflows/schemas/dag-node';
+export type { EffortLevel, SandboxSettings };

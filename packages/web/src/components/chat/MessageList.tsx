@@ -182,12 +182,14 @@ function WorkflowResultCard({
   const fetchFailed = isError && !liveState;
 
   // Status-aware header title
-  const headerTitle =
-    status === 'failed'
-      ? 'Workflow failed'
-      : status === 'cancelled'
-        ? 'Workflow cancelled'
-        : 'Workflow complete';
+  let headerTitle: string;
+  if (status === 'failed') {
+    headerTitle = 'Workflow failed';
+  } else if (status === 'cancelled') {
+    headerTitle = 'Workflow cancelled';
+  } else {
+    headerTitle = 'Workflow complete';
+  }
 
   // Expand/collapse for text content
   const lines = content.split('\n');
@@ -220,7 +222,7 @@ function WorkflowResultCard({
           )}
           <button
             onClick={(): void => {
-              navigate(`/workflows/runs/${runId}`);
+              navigate(`/legacy/workflows/runs/${runId}`);
             }}
             className="text-[10px] text-primary hover:text-accent-bright transition-colors shrink-0"
           >
@@ -337,7 +339,7 @@ function MessageListRaw({
                 variant="outline"
                 size="sm"
                 onClick={(): void => {
-                  navigate('/workflows');
+                  navigate('/legacy/workflows');
                 }}
                 className="flex items-center gap-1.5"
               >

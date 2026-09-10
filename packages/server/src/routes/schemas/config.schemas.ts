@@ -2,9 +2,45 @@
  * Zod schemas for configuration API endpoints.
  */
 import { z } from '@hono/zod-openapi';
+import { effortLevelSchema, rejectRetiredThinking } from '@archon/workflows/schemas/effort';
 
 /** Schema for the safe config subset returned to web clients (mirrors SafeConfig in config-types.ts). */
 const providerDefaultsSchema = z.record(z.string(), z.unknown()).openapi('ProviderDefaults');
+
+/**
+ * A single model-tier preset — mirrors `RawAliasEntry` in
+ * `@archon/workflows/model-validation` ({ provider, model, effort? }).
+ */
+export const tierEntrySchema = z
+  .preprocess(
+    rejectRetiredThinking,
+    z.object({
+      provider: z.string().min(1),
+      model: z.string().min(1),
+      effort: effortLevelSchema.optional(),
+    })
+  )
+  .openapi('TierEntry');
+
+/** The three reserved tiers, each optional — mirrors `RawTiersConfig`. */
+export const tiersConfigSchema = z
+  .object({
+    small: tierEntrySchema.optional(),
+    medium: tierEntrySchema.optional(),
+    large: tierEntrySchema.optional(),
+  })
+  .openapi('TiersConfig');
+
+/** PATCH /api/config/tiers body — each tier optional; `null` unsets that tier. */
+export const updateTiersBodySchema = z
+  .object({
+    tiers: z.object({
+      small: tierEntrySchema.nullable().optional(),
+      medium: tierEntrySchema.nullable().optional(),
+      large: tierEntrySchema.nullable().optional(),
+    }),
+  })
+  .openapi('UpdateTiersBody');
 
 export const safeConfigSchema = z
   .object({
@@ -23,8 +59,21 @@ export const safeConfigSchema = z
       loadDefaultCommands: z.boolean(),
       loadDefaultWorkflows: z.boolean(),
     }),
+    // Configured small/medium/large tiers (merged repo > global). Absent keys
+    // fall back to `tierDefaults` (built-in presets for the default provider).
+    tiers: tiersConfigSchema.optional(),
+    tierDefaults: tiersConfigSchema.optional(),
+    // Configured @custom model aliases (merged repo > global). Not secrets.
+    aliases: z.record(z.string(), tierEntrySchema).optional(),
   })
   .openapi('SafeConfig');
+
+/** PATCH /api/config/aliases body — per-key merge; `null` unsets that alias. */
+export const updateAliasesBodySchema = z
+  .object({
+    aliases: z.record(z.string(), tierEntrySchema.nullable()),
+  })
+  .openapi('UpdateAliasesBody');
 
 /** Body for PATCH /api/config/assistants — all fields optional (partial update). */
 export const updateAssistantConfigBodySchema = z

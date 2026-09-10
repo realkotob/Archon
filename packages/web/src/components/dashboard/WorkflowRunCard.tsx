@@ -19,19 +19,23 @@ import {
 } from 'lucide-react';
 import type { DashboardRunResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { ideUri } from '@/lib/ide-uri';
 import { formatDuration } from '@/lib/format';
 import { useWorkflowStore } from '@/stores/workflow-store';
 import type { WorkflowState } from '@/lib/types';
+import { ConfirmRunActionDialog } from './ConfirmRunActionDialog';
 
 interface WorkflowRunCardProps {
   run: DashboardRunResponse;
   isDocker?: boolean;
+  isWsl?: boolean;
+  wslDistro?: string;
   onCancel: (runId: string) => void;
   onResume?: (runId: string) => void;
   onAbandon?: (runId: string) => void;
   onDelete?: (runId: string) => void;
   onApprove?: (runId: string) => void;
-  onReject?: (runId: string) => void;
+  onReject?: (runId: string, reason?: string) => void;
 }
 
 const PLATFORM_ICONS: Record<string, React.ReactElement> = {
@@ -50,26 +54,26 @@ function StepProgress({
   liveState: WorkflowState | undefined;
 }): React.ReactElement | null {
   const dagNodes = liveState?.dagNodes ?? [];
-  const runningNode = dagNodes
-    .slice()
-    .reverse()
-    .find(n => n.status === 'running');
+  const activeNodeNames = liveState?.activeNodeIds ?? run.active_nodes;
   const completedCount = dagNodes.filter(n => n.status === 'completed').length;
-  const totalNodes = dagNodes.length || run.total_steps || 0;
-  const stepName = runningNode?.name ?? run.current_step_name;
+  const totalNodes = run.total_steps ?? 0;
   const currentTool = liveState?.currentTool ?? null;
 
-  const hasProgress = runningNode != null || totalNodes > 0;
+  const hasProgress = activeNodeNames.length > 0 || totalNodes > 0;
   if (!hasProgress && !currentTool) return null;
 
   return (
     <div className="rounded-md bg-surface-elevated px-3 py-2 space-y-1">
       {hasProgress && (
         <div className="flex items-center gap-2 text-sm text-text-primary">
-          <span className="font-medium">
-            {`${String(completedCount)}${totalNodes ? `/${String(totalNodes)}` : ''} nodes`}
-          </span>
-          {stepName && <span className="text-text-secondary">{stepName}</span>}
+          {totalNodes > 0 && (
+            <span className="font-medium">{`${String(completedCount)}/${String(totalNodes)} nodes`}</span>
+          )}
+          {activeNodeNames.length > 0 && (
+            <span className="text-text-secondary">
+              Active node{activeNodeNames.length === 1 ? '' : 's'}: {activeNodeNames.join(', ')}
+            </span>
+          )}
         </div>
       )}
       {currentTool && (
@@ -111,6 +115,35 @@ function isValidNodeCounts(value: unknown): value is NodeCounts {
   );
 }
 
+interface ScheduledResumeMetadata {
+  resumeAt: string;
+  attempt: number;
+  maxAttempts: number;
+}
+
+function readScheduledResumeMetadata(value: unknown): ScheduledResumeMetadata | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const scheduled = value as Record<string, unknown>;
+  if (
+    scheduled.reason !== 'quota' ||
+    typeof scheduled.resumeAt !== 'string' ||
+    typeof scheduled.attempt !== 'number' ||
+    typeof scheduled.maxAttempts !== 'number' ||
+    scheduled.triggeredAt !== undefined
+  ) {
+    return null;
+  }
+  return {
+    resumeAt: scheduled.resumeAt,
+    attempt: scheduled.attempt,
+    maxAttempts: scheduled.maxAttempts,
+  };
+}
+
+function hasApprovalMetadata(value: unknown): boolean {
+  return typeof value === 'object' && value !== null;
+}
+
 function NodeCountsSummary({ counts }: { counts: NodeCounts }): React.ReactElement {
   const hasFailures = counts.failed > 0 || counts.skipped > 0;
   return (
@@ -136,6 +169,8 @@ function NodeCountsSummary({ counts }: { counts: NodeCounts }): React.ReactEleme
 export function WorkflowRunCard({
   run,
   isDocker,
+  isWsl,
+  wslDistro,
   onCancel,
   onResume,
   onAbandon,
@@ -167,6 +202,9 @@ export function WorkflowRunCard({
       ? run.user_message
       : run.user_message.slice(0, 80) + '…'
     : null;
+  const wait = run.metadata.wait ?? undefined;
+  const scheduledResume = readScheduledResumeMetadata(run.metadata?.scheduled_resume);
+  const hasApproval = wait === undefined && hasApprovalMetadata(run.metadata?.approval);
 
   return (
     <div className="rounded-lg border border-border bg-surface p-4 space-y-3">
@@ -222,7 +260,7 @@ export function WorkflowRunCard({
         {run.parent_platform_id && run.parent_platform_id !== run.worker_platform_id && (
           <button
             onClick={(): void => {
-              navigate(`/chat/${encodeURIComponent(run.parent_platform_id ?? '')}`);
+              navigate(`/legacy/chat/${encodeURIComponent(run.parent_platform_id ?? '')}`);
             }}
             className="flex items-center gap-1 text-primary/80 hover:text-primary transition-colors"
           >
@@ -252,7 +290,7 @@ export function WorkflowRunCard({
       )}
 
       {/* Approval request message */}
-      {run.status === 'paused' && run.metadata?.approval != null && (
+      {run.status === 'paused' && hasApproval && (
         <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
           <Pause className="h-4 w-4 text-warning shrink-0 mt-0.5" />
           <p className="text-xs text-text-secondary">
@@ -261,6 +299,29 @@ export function WorkflowRunCard({
                 message?: string;
               }
             )?.message ?? 'Waiting for approval'}
+          </p>
+        </div>
+      )}
+
+      {run.status === 'paused' && wait !== undefined && (
+        <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
+          <Pause className="h-4 w-4 text-warning shrink-0 mt-0.5" />
+          <p className="text-xs text-text-secondary">
+            {wait.kind === 'attention'
+              ? wait.message
+              : wait.kind === 'event'
+                ? `Waiting for event '${wait.event ?? '?'}' until ${wait.resumeAt}`
+                : `Waiting until ${wait.resumeAt}`}
+          </p>
+        </div>
+      )}
+
+      {run.status === 'failed' && scheduledResume !== null && (
+        <div className="rounded-md bg-primary/5 border border-primary/20 px-3 py-2 flex items-start gap-2">
+          <PlayCircle className="h-4 w-4 text-primary shrink-0 mt-0.5" />
+          <p className="text-xs text-text-secondary">
+            Resume scheduled for {scheduledResume.resumeAt} (attempt{' '}
+            {String(scheduledResume.attempt)}/{String(scheduledResume.maxAttempts)})
           </p>
         </div>
       )}
@@ -276,7 +337,7 @@ export function WorkflowRunCard({
       <div className="flex flex-wrap items-center gap-2 pt-1">
         <button
           onClick={(): void => {
-            navigate(`/workflows/runs/${run.id}`);
+            navigate(`/legacy/workflows/runs/${run.id}`);
           }}
           className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated hover:text-text-primary transition-colors"
         >
@@ -286,7 +347,7 @@ export function WorkflowRunCard({
         {chatId && (
           <button
             onClick={(): void => {
-              navigate(`/chat/${encodeURIComponent(chatId)}`);
+              navigate(`/legacy/chat/${encodeURIComponent(chatId)}`);
             }}
             className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated hover:text-text-primary transition-colors"
           >
@@ -296,7 +357,7 @@ export function WorkflowRunCard({
         )}
         {run.working_path && !isDocker && (
           <a
-            href={`vscode://file/${run.working_path.replace(/\\/g, '/')}`}
+            href={ideUri(run.working_path, { is_wsl: isWsl, wsl_distro: wslDistro })}
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-secondary hover:bg-surface-elevated hover:text-text-primary transition-colors"
@@ -306,7 +367,7 @@ export function WorkflowRunCard({
           </a>
         )}
         <div className="ml-auto flex items-center gap-1">
-          {run.status === 'paused' && onApprove && (
+          {run.status === 'paused' && hasApproval && onApprove && (
             <button
               onClick={(): void => {
                 onApprove(run.id);
@@ -317,72 +378,107 @@ export function WorkflowRunCard({
               Approve
             </button>
           )}
-          {run.status === 'paused' && onReject && (
-            <button
-              onClick={(): void => {
-                if (window.confirm(`Reject workflow "${run.workflow_name}"?`)) {
-                  onReject(run.id);
+          {run.status === 'paused' && hasApproval && onReject && (
+            <ConfirmRunActionDialog
+              trigger={
+                <button className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors">
+                  <XCircle className="h-3.5 w-3.5" />
+                  Reject
+                </button>
+              }
+              title="Reject workflow?"
+              description={
+                <>
+                  Reject the paused workflow <strong>{run.workflow_name}</strong>. If the approval
+                  node defines an <code>on_reject</code> prompt, it runs with your reason as{' '}
+                  <code>$REJECTION_REASON</code>; otherwise the run is cancelled.
+                </>
+              }
+              confirmLabel="Reject"
+              reasonInput={{
+                label: 'Reason (optional)',
+                placeholder: 'Why are you rejecting? Visible to the on_reject prompt.',
+              }}
+              onConfirm={(reason): void => {
+                onReject(run.id, reason);
+              }}
+            />
+          )}
+          {(run.status === 'failed' || (run.status === 'paused' && wait?.kind === 'attention')) &&
+            onResume && (
+              <button
+                onClick={(): void => {
+                  onResume(run.id);
+                }}
+                className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors"
+              >
+                <PlayCircle className="h-3.5 w-3.5" />
+                Resume
+              </button>
+            )}
+          {(run.status === 'running' || (run.status === 'paused' && wait?.kind === 'attention')) &&
+            onAbandon && (
+              <ConfirmRunActionDialog
+                trigger={
+                  <button className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors">
+                    <Ban className="h-3.5 w-3.5" />
+                    Abandon
+                  </button>
                 }
-              }}
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors"
-            >
-              <XCircle className="h-3.5 w-3.5" />
-              Reject
-            </button>
-          )}
-          {run.status === 'failed' && onResume && (
-            <button
-              onClick={(): void => {
-                onResume(run.id);
-              }}
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors"
-            >
-              <PlayCircle className="h-3.5 w-3.5" />
-              Resume
-            </button>
-          )}
-          {run.status === 'running' && onAbandon && (
-            <button
-              onClick={(): void => {
-                if (window.confirm(`Abandon workflow "${run.workflow_name}"?`)) {
+                title="Abandon workflow?"
+                description={
+                  <>
+                    Mark <strong>{run.workflow_name}</strong> as cancelled. Already-completed nodes
+                    remain in the database; the run will not continue.
+                  </>
+                }
+                confirmLabel="Abandon"
+                onConfirm={(): void => {
                   onAbandon(run.id);
-                }
-              }}
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors"
-            >
-              <Ban className="h-3.5 w-3.5" />
-              Abandon
-            </button>
-          )}
+                }}
+              />
+            )}
           {(run.status === 'running' || run.status === 'pending') && (
-            <button
-              onClick={(): void => {
-                if (window.confirm(`Cancel workflow "${run.workflow_name}"?`)) {
-                  onCancel(run.id);
-                }
+            <ConfirmRunActionDialog
+              trigger={
+                <button className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors">
+                  <XCircle className="h-3.5 w-3.5" />
+                  Cancel
+                </button>
+              }
+              title="Cancel workflow?"
+              description={
+                <>
+                  Cancel <strong>{run.workflow_name}</strong>. The run will be marked as cancelled
+                  and any in-flight subprocess will be terminated.
+                </>
+              }
+              confirmLabel="Cancel workflow"
+              onConfirm={(): void => {
+                onCancel(run.id);
               }}
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors"
-            >
-              <XCircle className="h-3.5 w-3.5" />
-              Cancel
-            </button>
+            />
           )}
           {onDelete && run.status !== 'running' && run.status !== 'pending' && (
-            <button
-              onClick={(): void => {
-                if (
-                  window.confirm(
-                    `Delete workflow run "${run.workflow_name}"? This cannot be undone.`
-                  )
-                ) {
-                  onDelete(run.id);
-                }
+            <ConfirmRunActionDialog
+              trigger={
+                <button className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-tertiary hover:bg-error/10 hover:text-error transition-colors">
+                  <Trash2 className="h-3.5 w-3.5" />
+                  Delete
+                </button>
+              }
+              title="Delete workflow run?"
+              description={
+                <>
+                  Permanently delete the run record for <strong>{run.workflow_name}</strong> and its
+                  events. This cannot be undone.
+                </>
+              }
+              confirmLabel="Delete"
+              onConfirm={(): void => {
+                onDelete(run.id);
               }}
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-text-tertiary hover:bg-error/10 hover:text-error transition-colors"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              Delete
-            </button>
+            />
           )}
         </div>
       </div>

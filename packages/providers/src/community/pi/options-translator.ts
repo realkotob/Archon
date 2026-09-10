@@ -1,0 +1,240 @@
+import {
+  createBashTool,
+  createCodingTools,
+  createEditTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  createReadTool,
+  createWriteTool,
+  type BashSpawnContext,
+  type BashSpawnHook,
+} from '@earendil-works/pi-coding-agent';
+import type { ThinkingLevel } from '@earendil-works/pi-ai';
+
+/**
+ * Pi's exported `Tool` type is structurally `AgentTool<TSchema>` and isn't
+ * re-exported at the package root. Pi 0.68+ removed the `codingTools`
+ * aggregate in favor of a `createCodingTools(cwd, options)` factory, so we
+ * derive the element type from the factory's return type — still
+ * namespace-free, still satisfies TS's portable-type requirement.
+ */
+type PiTool = ReturnType<typeof createCodingTools>[number];
+
+import type { NodeConfig } from '../../types';
+import { clampEffort, type AssertNever } from '@archon/paths/effort';
+
+// ─── Thinking level ────────────────────────────────────────────────────────
+
+/**
+ * Pi's `ThinkingLevel` spans the shared ladder through `max`; stronger rungs
+ * clamp to `max`.
+ *
+ * `satisfies` alone would not have caught the omission this list previously
+ * carried: it proves every element IS a `ThinkingLevel` (containment), not that
+ * every `ThinkingLevel` appears (coverage). Missing `max` type-checked cleanly
+ * while silently downgrading `effort: max` on every Pi model that supports it.
+ * The coverage assertion below is the half `satisfies` cannot express.
+ */
+const PI_NATIVE_LEVELS = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const satisfies readonly ThinkingLevel[];
+
+/** Compile-time proof that PI_NATIVE_LEVELS covers Pi's whole vocabulary — a
+ *  rung the SDK gains (or one dropped here) becomes a type error, not a silent
+ *  downgrade. */
+export type PiLevelsAreComplete = AssertNever<
+  Exclude<ThinkingLevel, (typeof PI_NATIVE_LEVELS)[number]>
+>;
+
+function normalizeToThinkingLevel(v: unknown): ThinkingLevel | undefined {
+  return clampEffort(v, PI_NATIVE_LEVELS);
+}
+
+export interface ResolvedThinkingLevel {
+  /** ThinkingLevel to pass to Pi, or undefined for Pi's default (implicit off) */
+  level: ThinkingLevel | undefined;
+  /** Human-readable warning to surface as a system chunk, if the input shape wasn't usable */
+  warning?: string;
+}
+
+/**
+ * Resolve Archon's `effort` field to Pi's SDK-native `ThinkingLevel`.
+ */
+export function resolvePiThinkingLevel(nodeConfig?: NodeConfig): ResolvedThinkingLevel {
+  if (!nodeConfig) return { level: undefined };
+
+  const effortLevel = normalizeToThinkingLevel(nodeConfig.effort);
+  if (effortLevel) return { level: effortLevel };
+
+  if (nodeConfig.effort !== undefined) {
+    return {
+      level: undefined,
+      warning: `Pi ignored invalid effort '${nodeConfig.effort}'.`,
+    };
+  }
+
+  return { level: undefined };
+}
+
+// ─── Tool restrictions ─────────────────────────────────────────────────────
+
+/** Pi's seven built-in coding tools. */
+const PI_TOOL_NAMES = ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls'] as const;
+export type PiToolName = (typeof PI_TOOL_NAMES)[number];
+
+/**
+ * Build a Pi `spawnHook` that merges managed env vars into every bash
+ * subprocess. Matches Claude/Codex precedence: caller-provided env keys
+ * override Pi's inherited baseline. Returns undefined when `env` is empty
+ * so bash spawns without an unnecessary hook allocation.
+ */
+function buildBashSpawnHook(env: Record<string, string> | undefined): BashSpawnHook | undefined {
+  if (!env || Object.keys(env).length === 0) return undefined;
+  return (context: BashSpawnContext): BashSpawnContext => ({
+    ...context,
+    env: { ...context.env, ...env },
+  });
+}
+
+/** Map a normalized (lowercase) Pi tool name to its Pi-internal factory. */
+function buildPiTool(name: PiToolName, cwd: string, spawnHook: BashSpawnHook | undefined): PiTool {
+  switch (name) {
+    case 'read':
+      return createReadTool(cwd);
+    case 'bash':
+      return spawnHook ? createBashTool(cwd, { spawnHook }) : createBashTool(cwd);
+    case 'edit':
+      return createEditTool(cwd);
+    case 'write':
+      return createWriteTool(cwd);
+    case 'grep':
+      return createGrepTool(cwd);
+    case 'find':
+      return createFindTool(cwd);
+    case 'ls':
+      return createLsTool(cwd);
+  }
+}
+
+export interface ResolvedTools {
+  /**
+   * The tools array to pass to Pi, or `undefined` to leave Pi's default
+   * (read/bash/edit/write) in place. An empty array means "no tools —
+   * LLM-only response" which is a valid explicit setting.
+   */
+  tools: PiTool[] | undefined;
+  /** Unknown tool names in allowed_tools / denied_tools (e.g. Claude-specific like WebFetch). */
+  unknownTools: string[];
+}
+
+/** Pi's default coding-tool set (mirrors `codingTools` export: read/bash/edit/write). */
+const PI_DEFAULT_TOOL_NAMES = [
+  'read',
+  'bash',
+  'edit',
+  'write',
+] as const satisfies readonly PiToolName[];
+
+/**
+ * Pi's default coding tools, rebuilt with managed-env injection. Used when
+ * attaching native tools to a chat that had no tool restrictions: setting
+ * `customTools` forces `noTools: 'builtin'`, so the defaults must be
+ * re-supplied or the agent loses bash/read/edit/write.
+ */
+export function buildDefaultPiTools(cwd: string, env?: Record<string, string>): PiTool[] {
+  const spawnHook = buildBashSpawnHook(env);
+  return PI_DEFAULT_TOOL_NAMES.map(name => buildPiTool(name, cwd, spawnHook));
+}
+
+/**
+ * Filter Pi's built-in tool set against Archon's `allowed_tools` /
+ * `denied_tools` node config, with managed env injected into any bash tool.
+ *
+ * Semantics:
+ *   - neither allow/deny set, no env → return undefined (Pi's default tools)
+ *   - neither allow/deny set, env present → return Pi's default 4 tools with
+ *     an env-aware bash, so codebase env vars reach bash subprocesses
+ *   - allowed_tools: [] → return [] (explicit no-tools; valid Archon idiom)
+ *   - allowed_tools: [X, Y] → only X, Y (normalized to lowercase)
+ *   - denied_tools subtracts from allowed_tools (or full set if allowed_tools absent)
+ *   - tool names not in Pi's built-in set are silently dropped but reported
+ *     via `unknownTools` so the caller can surface a warning.
+ *
+ * The `env` parameter is the caller's `requestOptions.env` merged with any
+ * relevant defaults; when non-empty, it is injected into every bash spawn via
+ * a `BashSpawnHook`, matching Claude's `options.env` and Codex's constructor
+ * `env` behavior so codebase-scoped env vars reach tool subprocesses.
+ */
+export function resolvePiTools(
+  cwd: string,
+  nodeConfig?: NodeConfig,
+  env?: Record<string, string>
+): ResolvedTools {
+  const allowed = nodeConfig?.allowed_tools;
+  const denied = nodeConfig?.denied_tools;
+  const spawnHook = buildBashSpawnHook(env);
+
+  if (allowed === undefined && denied === undefined) {
+    // No restrictions. Match Pi's default tool set unless env injection forces
+    // a custom bash tool (Pi's default bashTool is pre-constructed with no
+    // spawnHook and there's no way to retrofit env onto it).
+    if (!spawnHook) return { tools: undefined, unknownTools: [] };
+    return {
+      tools: PI_DEFAULT_TOOL_NAMES.map(n => buildPiTool(n, cwd, spawnHook)),
+      unknownTools: [],
+    };
+  }
+
+  const knownSet = new Set<PiToolName>(PI_TOOL_NAMES);
+  const unknownTools: string[] = [];
+
+  function classify(name: string): PiToolName | undefined {
+    const lower = name.toLowerCase();
+    if (knownSet.has(lower as PiToolName)) return lower as PiToolName;
+    unknownTools.push(name);
+    return undefined;
+  }
+
+  let selected: PiToolName[];
+  if (allowed !== undefined) {
+    selected = allowed.map(classify).filter((n): n is PiToolName => n !== undefined);
+  } else {
+    selected = [...PI_TOOL_NAMES];
+  }
+
+  if (denied !== undefined) {
+    const deniedSet = new Set<PiToolName>();
+    for (const raw of denied) {
+      const norm = classify(raw);
+      if (norm) deniedSet.add(norm);
+    }
+    selected = selected.filter(n => !deniedSet.has(n));
+  }
+
+  // Dedupe by name (handles allowed_tools: ['read', 'read'])
+  const seen = new Set<PiToolName>();
+  const unique = selected.filter(n => {
+    if (seen.has(n)) return false;
+    seen.add(n);
+    return true;
+  });
+
+  return {
+    tools: unique.map(n => buildPiTool(n, cwd, spawnHook)),
+    unknownTools,
+  };
+}
+
+// ─── Skills ────────────────────────────────────────────────────────────────
+
+// Skill resolution is shared across providers. Re-export `resolvePiSkills` as
+// an alias of the shared `resolveSkillDirectories` so existing Pi callers and
+// tests keep their import path stable.
+export { resolveSkillDirectories as resolvePiSkills } from '../../shared/skills';
+export type { ResolvedSkills } from '../../shared/skills';

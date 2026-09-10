@@ -1,10 +1,17 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { CheckCircle, ChevronRight, Loader2, Pause, XCircle } from 'lucide-react';
+import { CheckCircle, ChevronRight, Loader2, Pause, PlayCircle, XCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { approveWorkflowRun, getWorkflowRunByWorker, rejectWorkflowRun } from '@/lib/api';
+import {
+  abandonWorkflowRun,
+  approveWorkflowRun,
+  getWorkflowRunByWorker,
+  rejectWorkflowRun,
+  resumeWorkflowRun,
+} from '@/lib/api';
 import { useWorkflowStore } from '@/stores/workflow-store';
+import { ConfirmRunActionDialog } from '@/components/dashboard/ConfirmRunActionDialog';
 import { StatusIcon } from '@/components/workflows/StatusIcon';
 import { formatDurationMs } from '@/lib/format';
 import { isTerminalStatus } from '@/lib/workflow-utils';
@@ -13,6 +20,66 @@ import type { DagNodeState } from '@/lib/types';
 interface WorkflowProgressCardProps {
   workflowName: string;
   workerConversationId: string;
+}
+
+interface AttentionWaitControlsProps {
+  runId: string | undefined;
+  workflowName: string;
+  message: string;
+  busy: boolean;
+  onResume: (runId: string) => void;
+  onAbandon: (runId: string) => void;
+}
+
+export function AttentionWaitControls({
+  runId,
+  workflowName,
+  message,
+  busy,
+  onResume,
+  onAbandon,
+}: AttentionWaitControlsProps): React.ReactElement {
+  return (
+    <>
+      <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
+        <Pause className="h-3.5 w-3.5 text-warning shrink-0 mt-0.5" />
+        <p className="text-xs text-text-secondary">{message}</p>
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => {
+            if (runId !== undefined) onResume(runId);
+          }}
+          disabled={runId === undefined || busy}
+          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors disabled:opacity-50"
+        >
+          <PlayCircle className="h-3.5 w-3.5" />
+          Resume
+        </button>
+        <ConfirmRunActionDialog
+          trigger={
+            <button
+              disabled={runId === undefined || busy}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors disabled:opacity-50"
+            >
+              <XCircle className="h-3.5 w-3.5" />
+              Abandon
+            </button>
+          }
+          title="Abandon workflow?"
+          description={
+            <>
+              Abandon <strong>{workflowName}</strong> instead of completing the outside action.
+            </>
+          }
+          confirmLabel="Abandon"
+          onConfirm={(): void => {
+            if (runId !== undefined) onAbandon(runId);
+          }}
+        />
+      </div>
+    </>
+  );
 }
 
 export function WorkflowProgressCard({
@@ -30,14 +97,14 @@ export function WorkflowProgressCard({
     queryKey: ['workflowRunByWorker', workerConversationId],
     queryFn: () => getWorkflowRunByWorker(workerConversationId),
     refetchInterval: (query): number | false => {
-      const status = query.state.data?.run.status;
+      const status = query.state.data?.run?.status;
       if (status === 'completed' || status === 'failed' || status === 'cancelled') return false;
       return 3000;
     },
   });
 
-  const runId = runData?.run.id;
-  const restStatus = runData?.run.status;
+  const runId = runData?.run?.id;
+  const restStatus = runData?.run?.status;
 
   // Live SSE state from Zustand store
   const liveState = useWorkflowStore(state => (runId ? state.workflows.get(runId) : undefined));
@@ -47,6 +114,8 @@ export function WorkflowProgressCard({
   const dagNodes: DagNodeState[] = liveState?.dagNodes ?? [];
   const currentTool = liveState?.currentTool ?? null;
   const approval = liveState?.approval ?? null;
+  const wait = runData?.run?.metadata.wait;
+  const attentionMessage = wait?.kind === 'attention' ? wait.message : null;
   const error = liveState?.error;
   const startedAt = liveState?.startedAt;
 
@@ -82,14 +151,21 @@ export function WorkflowProgressCard({
     };
   }, [isRunning, startedAt]);
 
-  // Approve/reject mutations
+  // Paused-run mutations
   const approveMutation = useMutation({
     mutationFn: () => approveWorkflowRun(runId ?? ''),
   });
   const rejectMutation = useMutation({
-    mutationFn: () => rejectWorkflowRun(runId ?? ''),
+    mutationFn: (reason?: string) => rejectWorkflowRun(runId ?? '', reason),
   });
-  const mutationError = approveMutation.error ?? rejectMutation.error;
+  const resumeMutation = useMutation({
+    mutationFn: resumeWorkflowRun,
+  });
+  const abandonMutation = useMutation({
+    mutationFn: abandonWorkflowRun,
+  });
+  const mutationError =
+    approveMutation.error ?? rejectMutation.error ?? resumeMutation.error ?? abandonMutation.error;
 
   // Completed duration from live state
   const completedAt = liveState?.completedAt;
@@ -102,9 +178,9 @@ export function WorkflowProgressCard({
 
   const handleViewFullScreen = (): void => {
     if (runId) {
-      navigate(`/workflows/runs/${runId}`);
+      navigate(`/legacy/workflows/runs/${runId}`);
     } else {
-      navigate(`/chat/${encodeURIComponent(workerConversationId)}`);
+      navigate(`/legacy/chat/${encodeURIComponent(workerConversationId)}`);
     }
   };
 
@@ -200,40 +276,75 @@ export function WorkflowProgressCard({
             </div>
           )}
 
-          {/* Approval request banner */}
+          {/* Paused-run controls */}
           {isPaused && (
             <div className="border-t border-border px-3 py-2 space-y-2">
-              <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
-                <Pause className="h-3.5 w-3.5 text-warning shrink-0 mt-0.5" />
-                <p className="text-xs text-text-secondary">
-                  {approval?.message ?? 'Waiting for approval'}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    approveMutation.mutate();
+              {attentionMessage !== null ? (
+                <AttentionWaitControls
+                  runId={runId}
+                  workflowName={workflowName}
+                  message={attentionMessage}
+                  busy={resumeMutation.isPending || abandonMutation.isPending}
+                  onResume={id => {
+                    resumeMutation.mutate(id);
                   }}
-                  disabled={!runId || approveMutation.isPending || rejectMutation.isPending}
-                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-success/80 hover:bg-success/10 hover:text-success transition-colors disabled:opacity-50"
-                >
-                  <CheckCircle className="h-3.5 w-3.5" />
-                  Approve
-                </button>
-                <button
-                  onClick={() => {
-                    if (window.confirm(`Reject workflow "${workflowName}"?`)) {
-                      rejectMutation.mutate();
-                    }
+                  onAbandon={id => {
+                    abandonMutation.mutate(id);
                   }}
-                  disabled={!runId || approveMutation.isPending || rejectMutation.isPending}
-                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors disabled:opacity-50"
-                >
-                  <XCircle className="h-3.5 w-3.5" />
-                  Reject
-                </button>
-              </div>
-              {(approveMutation.isError || rejectMutation.isError) && (
+                />
+              ) : (
+                <>
+                  <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
+                    <Pause className="h-3.5 w-3.5 text-warning shrink-0 mt-0.5" />
+                    <p className="text-xs text-text-secondary">
+                      {approval?.message ?? 'Waiting for approval'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        approveMutation.mutate();
+                      }}
+                      disabled={!runId || approveMutation.isPending || rejectMutation.isPending}
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-success/80 hover:bg-success/10 hover:text-success transition-colors disabled:opacity-50"
+                    >
+                      <CheckCircle className="h-3.5 w-3.5" />
+                      Approve
+                    </button>
+                    <ConfirmRunActionDialog
+                      trigger={
+                        <button
+                          disabled={!runId || approveMutation.isPending || rejectMutation.isPending}
+                          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors disabled:opacity-50"
+                        >
+                          <XCircle className="h-3.5 w-3.5" />
+                          Reject
+                        </button>
+                      }
+                      title="Reject workflow?"
+                      description={
+                        <>
+                          Reject the paused workflow <strong>{workflowName}</strong>. If the
+                          approval node defines an <code>on_reject</code> prompt, it runs with your
+                          reason as <code>$REJECTION_REASON</code>; otherwise the run is cancelled.
+                        </>
+                      }
+                      confirmLabel="Reject"
+                      reasonInput={{
+                        label: 'Reason (optional)',
+                        placeholder: 'Why are you rejecting? Visible to the on_reject prompt.',
+                      }}
+                      onConfirm={(reason): void => {
+                        rejectMutation.mutate(reason);
+                      }}
+                    />
+                  </div>
+                </>
+              )}
+              {(approveMutation.isError ||
+                rejectMutation.isError ||
+                resumeMutation.isError ||
+                abandonMutation.isError) && (
                 <p className="text-xs text-error">
                   {mutationError instanceof Error
                     ? mutationError.message

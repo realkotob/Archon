@@ -1,10 +1,11 @@
 import { readFile, access } from 'fs/promises';
-import { join, resolve } from 'path';
+import { isAbsolute, join, resolve } from 'path';
 import {
   createLogger,
-  getArchonWorktreesPath,
   getArchonWorkspacesPath,
   getProjectWorktreesPath,
+  parseOwnerRepo,
+  resolveRepoProjectIdentity,
 } from '@archon/paths';
 import { execFileAsync } from './exec';
 import type { RepoPath, BranchName, WorktreePath, WorktreeInfo } from './types';
@@ -18,60 +19,124 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
- * Get the base directory for worktrees.
+ * Layout of a worktree base relative to the repository.
  *
- * Resolution order:
- * 1. If `codebaseName` is provided in "owner/repo" format, returns the project-scoped
- *    path directly: ~/.archon/workspaces/owner/repo/worktrees/
- * 2. For paths under ~/.archon/workspaces/owner/repo/..., extracts owner/repo from path
- *    and returns the project-scoped path.
- * 3. Otherwise, returns the legacy global path: ~/.archon/worktrees/
+ * Two layouts only — worktrees live either co-located with the repo (opt-in)
+ * or inside the user's archon workspace area (default for every repo):
+ *
+ * - `repo-local`       — `<repoRoot>/<override.repoLocal>/`  (opt-in per repo config)
+ * - `workspace-scoped` — `~/.archon/workspaces/<owner>/<repo>/worktrees/`  (default)
+ *
+ * In both layouts the base already includes all repo context, so callers append
+ * only the branch name to compose the final worktree path — there is no layout
+ * where owner/repo gets tacked on as a separate path segment.
  */
-export function getWorktreeBase(repoPath: RepoPath, codebaseName?: string): string {
-  // If codebase name is known, use project-scoped path directly
+export type WorktreeLayout = 'repo-local' | 'workspace-scoped';
+
+/**
+ * Override inputs for `getWorktreeBase()`. All fields are optional.
+ */
+export interface WorktreeBaseOverride {
+  /**
+   * Repo-relative path where worktrees should live (e.g. `.worktrees`).
+   * Only supported override today. Must be validated as a safe relative path
+   * by the caller before reaching this layer.
+   */
+  repoLocal?: string;
+}
+
+/**
+ * Resolve the `{ owner, repo }` identity used to scope archon-managed worktrees.
+ *
+ * Precedence:
+ *   1. Explicit `codebaseName` in strict `owner/repo` format (from the database /
+ *      web UI), validated by the shared `parseOwnerRepo()`
+ *   2. Path segments when `repoPath` is already under `~/.archon/workspaces/owner/repo/`
+ *   3. The shared project-identity fallback: `_local/<basename(repoPath)>`
+ *      (`resolveRepoProjectIdentity()` in `@archon/paths`)
+ *
+ * Identity decisions are delegated to `@archon/paths` so the worktree base
+ * always agrees with the storage identity that registration writes to disk and
+ * that log/artifact path resolution uses (#2227). Historically the fallback
+ * derived owner/repo from the last two path segments, inventing a junk "owner"
+ * from the checkout's parent directory and disagreeing with the `_local/`
+ * storage tree (#2132).
+ */
+function resolveOwnerRepo(
+  repoPath: RepoPath,
+  codebaseName?: string
+): { owner: string; repo: string } {
   if (codebaseName) {
-    const parts = codebaseName.split('/');
-    if (parts.length === 2 && parts[0] && parts[1]) {
-      return getProjectWorktreesPath(parts[0], parts[1]);
-    }
-    // codebaseName present but not "owner/repo" format — fall through to path detection.
-    // This is intentional: safe degradation to legacy global path.
+    // Reject names containing ':' or '@' — they would become path segments and
+    // break docker-compose short-form volume specs (HOST:CONTAINER:OPT) (#1583).
+    const parsed = parseOwnerRepo(codebaseName);
+    if (parsed) return parsed;
     getLog().warn({ codebaseName }, 'worktree.invalid_codebase_name_format');
   }
-  // Existing path-prefix detection (cloned repos under workspaces/)
   const workspacesPath = getArchonWorkspacesPath();
   if (repoPath.startsWith(workspacesPath)) {
     const relative = repoPath.substring(workspacesPath.length + 1);
     const parts = relative.split(/[/\\]/).filter(p => p.length > 0);
     if (parts.length >= 2) {
-      return getProjectWorktreesPath(parts[0], parts[1]);
+      return { owner: parts[0], repo: parts[1] };
     }
   }
-  // Legacy global fallback (no codebase name, no workspace path match)
-  return getArchonWorktreesPath();
+  // Fallback: the shared storage-identity resolver — the same
+  // `_local/<basename>` identity that registration creates on disk and that
+  // the workflow executor uses for logs/artifacts, so all project paths agree.
+  // The name (if any) was already rejected above, so this resolves purely from
+  // the path.
+  const identity = resolveRepoProjectIdentity(codebaseName ?? '', repoPath);
+  if (!identity) {
+    throw new Error(
+      `Cannot derive a project identity from path "${repoPath}": basename is empty or a dot segment`
+    );
+  }
+  return identity;
 }
 
 /**
- * Check if the worktree base for a given repo path is project-scoped
- * (under ~/.archon/workspaces/owner/repo/worktrees/) vs legacy global.
+ * Get the base directory for worktrees and the resolved layout.
  *
- * When project-scoped, the worktree base already includes the owner/repo context,
- * so callers should NOT append owner/repo again.
+ * Resolution (highest to lowest priority):
+ *   1. `override.repoLocal` → `<repoRoot>/<repoLocal>/` (layout: `repo-local`)
+ *   2. Otherwise             → `~/.archon/workspaces/<owner>/<repo>/worktrees/`
+ *                              (layout: `workspace-scoped`)
  *
- * Resolution order mirrors `getWorktreeBase`: codebaseName → path detection → legacy.
+ * The `<owner>/<repo>` identity is resolved via `resolveOwnerRepo()` — see its
+ * docstring for the precedence. Every repo ends up with a stable workspace-scoped
+ * base; there is no `~/.archon/worktrees/owner/repo/` fallback layout.
+ */
+export function getWorktreeBase(
+  repoPath: RepoPath,
+  codebaseName?: string,
+  override?: WorktreeBaseOverride
+): { base: string; layout: WorktreeLayout } {
+  if (override?.repoLocal) {
+    return { base: join(repoPath, override.repoLocal), layout: 'repo-local' };
+  }
+  const { owner, repo } = resolveOwnerRepo(repoPath, codebaseName);
+  return {
+    base: getProjectWorktreesPath(owner, repo),
+    layout: 'workspace-scoped',
+  };
+}
+
+/**
+ * Check if the worktree base for a given repo path is workspace-scoped.
+ *
+ * Kept for backward compatibility with callers outside this package; prefer
+ * reading `layout` from `getWorktreeBase()` in new code. This helper is unaware
+ * of `override.repoLocal`, so it does not reflect per-repo overrides — use
+ * `getWorktreeBase(...).layout === 'workspace-scoped'` in override-aware code.
+ *
+ * @deprecated Use `getWorktreeBase(...).layout === 'workspace-scoped'` instead.
+ *   This helper returned `false` for pre-workspace registered repos in the old
+ *   two-layout model; in the current model every repo resolves to workspace-scoped
+ *   when no override is set, so this always returns `true`.
  */
 export function isProjectScopedWorktreeBase(repoPath: RepoPath, codebaseName?: string): boolean {
-  // If codebase name is known, it's always project-scoped
-  if (codebaseName) {
-    const parts = codebaseName.split('/');
-    if (parts.length === 2 && parts[0] && parts[1]) return true;
-    // Invalid format — fall through to path detection (same safe degradation as getWorktreeBase).
-  }
-  const workspacesPath = getArchonWorkspacesPath();
-  if (!repoPath.startsWith(workspacesPath)) return false;
-  const relative = repoPath.substring(workspacesPath.length + 1);
-  const parts = relative.split(/[/\\]/).filter(p => p.length > 0);
-  return parts.length >= 2;
+  return getWorktreeBase(repoPath, codebaseName).layout === 'workspace-scoped';
 }
 
 /**
@@ -229,29 +294,110 @@ export async function removeWorktree(
   });
 }
 
+export interface GitCheckoutIdentity {
+  gitDir: string;
+  commonGitDir: string;
+  linkedWorktree: boolean;
+}
+
+export class CanonicalRepoPathUnavailableError extends Error {
+  constructor(
+    readonly checkoutPath: string,
+    readonly commonGitDir: string
+  ) {
+    super(
+      `Cannot determine the primary checkout for linked worktree at ${checkoutPath}. ` +
+        `Git uses external directory ${commonGitDir}, which does not record the primary checkout path.`
+    );
+    this.name = 'CanonicalRepoPathUnavailableError';
+  }
+}
+
+/**
+ * Return Git's physical repository identity for a checkout.
+ *
+ * `--git-dir` and `--git-common-dir` are equal for independent checkouts and
+ * differ for linked worktrees. This avoids rebuilding valid Git layouts from
+ * pathname conventions (`.git/modules`, linked-superproject modules, or an
+ * external `--separate-git-dir`).
+ */
+export async function getGitCheckoutIdentity(path: string): Promise<GitCheckoutIdentity> {
+  const { stdout } = await execFileAsync('git', [
+    '-C',
+    path,
+    'rev-parse',
+    '--path-format=absolute',
+    '--git-dir',
+    '--git-common-dir',
+  ]);
+  const [gitDir, commonGitDir] = stdout.split(/\r?\n/).filter(line => line.length > 0);
+  if (!gitDir || !commonGitDir) {
+    throw new Error(`Git returned incomplete repository identity for ${path}`);
+  }
+  return {
+    gitDir,
+    commonGitDir,
+    linkedWorktree: resolve(gitDir) !== resolve(commonGitDir),
+  };
+}
+
+async function resolvePrimaryCheckout(
+  path: string,
+  identity: GitCheckoutIdentity
+): Promise<RepoPath> {
+  const { stdout: worktreeList } = await execFileAsync('git', [
+    '--git-dir',
+    identity.commonGitDir,
+    'worktree',
+    'list',
+    '--porcelain',
+  ]);
+  const firstWorktree = /^worktree (.+)$/m.exec(worktreeList)?.[1];
+  if (firstWorktree && resolve(firstWorktree) !== resolve(identity.commonGitDir)) {
+    return toRepoPath(firstWorktree);
+  }
+
+  try {
+    const { stdout } = await execFileAsync('git', [
+      '--git-dir',
+      identity.commonGitDir,
+      'config',
+      '--get',
+      'core.worktree',
+    ]);
+    const primaryCheckout = stdout.trim();
+    if (primaryCheckout) {
+      return toRepoPath(
+        isAbsolute(primaryCheckout)
+          ? primaryCheckout
+          : resolve(identity.commonGitDir, primaryCheckout)
+      );
+    }
+  } catch {
+    // External Git directories do not record a reverse pointer to their primary
+    // checkout. Registered-codebase lookup can still match their common Git dir.
+  }
+  throw new CanonicalRepoPathUnavailableError(path, identity.commonGitDir);
+}
+
 /**
  * Get canonical repo path from a worktree path
  * If already canonical, returns the same path
  */
 export async function getCanonicalRepoPath(path: string): Promise<RepoPath> {
   if (await isWorktreePath(path)) {
-    // Read .git file to find main repo
-    const gitPath = join(path, '.git');
-    const content = await readFile(gitPath, 'utf-8');
-    // gitdir: /path/to/repo/.git/worktrees/branch-name
-    const match = /gitdir: (.+)\/\.git\/worktrees\//.exec(content);
-    if (match) {
-      return toRepoPath(match[1]);
+    try {
+      const identity = await getGitCheckoutIdentity(path);
+      if (!identity.linkedWorktree) return toRepoPath(path);
+      return await resolvePrimaryCheckout(path, identity);
+    } catch (error) {
+      if (error instanceof CanonicalRepoPathUnavailableError) throw error;
+      getLog().error({ path, err: error as Error }, 'canonical_path_resolution_failed');
+      throw new Error(
+        `Cannot determine canonical repo path from worktree at ${path}: ${(error as Error).message}`,
+        { cause: error }
+      );
     }
-    // Worktree detected but regex didn't match - this is a real problem
-    getLog().error(
-      { path, gitContentPrefix: content.substring(0, 120) },
-      'canonical_path_regex_failed'
-    );
-    throw new Error(
-      `Cannot determine canonical repo path from worktree at ${path}. ` +
-        `Unexpected .git file format: ${content.substring(0, 80)}`
-    );
   }
   return toRepoPath(path);
 }
@@ -265,10 +411,8 @@ export async function getCanonicalRepoPath(path: string): Promise<RepoPath> {
  * worktree. This is intentionally strict — a permissive fallback here
  * would re-introduce the cross-checkout bug this guard exists to prevent.
  *
- * Paths are normalized with `resolve()` before comparison to handle trailing
- * slashes and relative components. Symlinked paths (where canonical vs
- * registered paths differ by symlink resolution) are not equated — callers
- * should register codebases with consistent path forms.
+ * Git's common-directory paths are normalized with `resolve()` before
+ * comparison to handle trailing slashes and relative components.
  *
  * Error classification (surfaced via `classifyIsolationError` in
  * `@archon/isolation/errors.ts`):
@@ -310,38 +454,37 @@ export async function verifyWorktreeOwnership(
     throw wrap(`Cannot verify worktree ownership at ${worktreePath}: ${err.message}`);
   }
 
-  // gitdir: /path/to/repo/.git/worktrees/branch-name
-  const match = /gitdir: (.+)\/\.git\/worktrees\//.exec(gitContent);
-  if (!match) {
+  if (!gitContent.startsWith('gitdir:')) {
+    throw new Error(`Cannot adopt ${worktreePath}: .git pointer is not a git-worktree reference.`);
+  }
+
+  let worktreeIdentity: GitCheckoutIdentity;
+  let expectedIdentity: GitCheckoutIdentity;
+  try {
+    [worktreeIdentity, expectedIdentity] = await Promise.all([
+      getGitCheckoutIdentity(worktreePath),
+      getGitCheckoutIdentity(expectedRepo),
+    ]);
+  } catch (error) {
+    throw new Error(
+      `Cannot verify worktree ownership at ${worktreePath}: ${(error as Error).message}`,
+      {
+        cause: error,
+      }
+    );
+  }
+  if (!worktreeIdentity.linkedWorktree) {
     // Not a git-worktree pointer (e.g., submodule pointer, or malformed).
     // We cannot confirm this is our worktree, so refuse adoption.
     throw new Error(`Cannot adopt ${worktreePath}: .git pointer is not a git-worktree reference.`);
   }
 
-  // Compare on resolved paths (normalizes trailing slashes and relative
-  // components) but display the raw path from the .git pointer so the user
-  // sees the value they'd recognize. On Windows, `resolve()` would prepend
-  // a drive letter to the POSIX-style gitdir, making the error message
-  // misleading and causing platform-specific test breakage.
-  const existingRepoRaw = match[1];
-  if (resolve(existingRepoRaw) !== resolve(expectedRepo)) {
+  // Compare resolved common-directory paths: the primary checkout and every
+  // linked worktree share this Git identity, while separate clones differ.
+  if (resolve(worktreeIdentity.commonGitDir) !== resolve(expectedIdentity.commonGitDir)) {
     throw new Error(
-      `Worktree at ${worktreePath} belongs to a different clone (${existingRepoRaw}). ` +
+      `Worktree at ${worktreePath} belongs to a different clone (${worktreeIdentity.commonGitDir}). ` +
         'Remove it from that clone or use a different codebase registration.'
     );
   }
-}
-
-/**
- * Extract owner and repo name from the last two segments of a repository path.
- * Throws if the path has fewer than 2 non-empty segments.
- */
-export function extractOwnerRepo(repoPath: RepoPath): { owner: string; repo: string } {
-  const parts = repoPath.split(/[/\\]/).filter(p => p.length > 0);
-  if (parts.length < 2) {
-    throw new Error(
-      `Cannot extract owner/repo from path "${repoPath}": expected at least 2 path segments`
-    );
-  }
-  return { owner: parts[parts.length - 2], repo: parts[parts.length - 1] };
 }

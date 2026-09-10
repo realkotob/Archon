@@ -51,6 +51,39 @@ export interface IDatabase {
 }
 
 /**
+ * The Postgres `NOTIFY` channel carrying one workflow-event insert, payload = the
+ * bare `workflow_run_id`. Named once here because it is a wire value with a producer
+ * (the trigger in `postgres.ts`) and several consumers, and a hand-copied literal in
+ * each is how they drift.
+ *
+ * The name is a misnomer — it carries every workflow event, not only dashboard ones —
+ * and is deliberately NOT renamed: an older binary sharing the same database listens
+ * on this exact string, so a rename would need a dual-notify transition for nothing.
+ */
+export const WORKFLOW_EVENT_NOTIFY_CHANNEL = 'archon_dashboard_event';
+
+/**
+ * Optional capability for databases that support push notifications
+ * (Postgres `LISTEN/NOTIFY`). Kept as a NARROW interface separate from
+ * `IDatabase` — only the Postgres adapter implements it; SQLite has no
+ * equivalent, so callers feature-detect via `getDbNotificationListener()`.
+ */
+export interface DbNotificationListener {
+  /**
+   * Subscribe to a `LISTEN` channel on a dedicated held connection.
+   * @param channel - channel name (validated; not parameterizable in `LISTEN`)
+   * @param onNotify - called with each notification payload
+   * @param onError - called when the underlying connection drops (so the caller can reconnect)
+   * @returns an unsubscribe that stops listening and destroys the dedicated connection
+   */
+  listen(
+    channel: string,
+    onNotify: (payload: string) => void,
+    onError: (err: Error) => void
+  ): Promise<() => void>;
+}
+
+/**
  * SQL dialect helpers for building queries
  */
 export interface SqlDialect {

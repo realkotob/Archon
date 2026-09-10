@@ -280,25 +280,54 @@ docker compose exec app ls -la /.archon/workspaces
 docker compose exec app git clone https://github.com/user/repo /.archon/workspaces/test-repo
 ```
 
-## Workflows Hang Silently When Run Inside Claude Code
+## "Claude Code not found" When Running Compiled Binary
 
-**Symptom:** Workflows started from within a Claude Code session (e.g., via the Terminal tool) produce no output, or the CLI emits a warning about `CLAUDECODE=1` before the workflow hangs.
+**Symptom:** A workflow that uses Claude fails with:
 
-**Cause:** Nested Claude Code sessions can deadlock — the outer session waits for tool results that the inner session never delivers.
-
-**Fix:** Run `archon serve` from a regular shell outside Claude Code and use the Web UI or HTTP API instead.
-
-**Suppress the warning:** If you have a non-deadlocking setup and want to silence the warning:
-
-```bash
-ARCHON_SUPPRESS_NESTED_CLAUDE_WARNING=1 archon workflow run ...
+```
+Claude Code not found. Archon requires the Claude Code executable to be
+reachable at a configured path in compiled builds.
 ```
 
-**Adjust the timeout:** If your environment is slow and hitting the 60-second first-event timeout:
+**Cause:** Compiled Archon binaries (`archon` from the curl/PowerShell installer or Homebrew) do not bundle Claude Code. They need an explicit path to the Claude Code executable. Source/dev mode (`bun run`) auto-resolves via `node_modules` and is unaffected.
+
+**Fix:** Install Claude Code separately and point Archon at it.
+
+```bash
+# macOS / Linux / WSL — Anthropic's recommended native installer
+curl -fsSL https://claude.ai/install.sh | bash
+export CLAUDE_BIN_PATH="$HOME/.local/bin/claude"
+
+# Windows (PowerShell)
+irm https://claude.ai/install.ps1 | iex
+$env:CLAUDE_BIN_PATH = "$env:USERPROFILE\.local\bin\claude.exe"
+```
+
+For a durable setup, set the path in `~/.archon/config.yaml` instead:
+
+```yaml
+assistants:
+  claude:
+    claudeBinaryPath: /absolute/path/to/claude
+```
+
+`archon setup` auto-detects and writes `CLAUDE_BIN_PATH` for you. After setup, run `archon doctor` to confirm the binary actually spawns. Docker users do not need to do anything — the image pre-sets the variable.
+
+See the [AI Assistants → Binary path configuration](/getting-started/ai-assistants/#binary-path-configuration-compiled-binaries-only) guide for the full install matrix.
+
+## Workflows Time Out Waiting for the First Event
+
+**Symptom:** A workflow node produces no output and eventually fails on a first-event timeout.
+
+**Cause:** A slow environment (cold model, constrained machine) can exceed the default 60-second wait for the AI provider's first event.
+
+**Fix:** Raise the timeout:
 
 ```bash
 ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS=120000 archon workflow run ...
 ```
+
+> Running `archon` from inside a Claude Code session (or another coding agent) is a supported, normal way to drive Archon — it no longer emits a warning.
 
 ## Worktree Belongs to a Different Clone
 
@@ -336,3 +365,20 @@ ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS=120000 archon workflow run ...
 - `path contains a full git checkout, not a worktree`: something non-Archon created a full git repo at the worktree path. Remove or move it.
 - `.git pointer is not a git-worktree reference`: the `.git` file at that path points somewhere unexpected (submodule, malformed). Inspect it with `cat <path>/.git` and clean up manually.
 - `Cannot verify worktree ownership`: filesystem permission or I/O error reading `<path>/.git`. Check `ls -la <path>` and file permissions on `~/.archon/workspaces`.
+
+## Chat Says the Working Directory No Longer Exists
+
+**Symptom:** A chat message in a project-scoped conversation is refused with:
+
+- `This conversation's working directory no longer exists: <path>`
+
+**Cause:** The conversation carries a working-directory override (`cwd`) pointing at a directory that has since been removed — an isolated worktree torn down by `archon isolation cleanup`, the periodic reaper, the Environments list in the web UI, or your own `rm -rf`. The override outlives the directory. Only workflow runs re-resolve isolation; a chat turn uses the recorded path as-is.
+
+Archon refuses the turn instead of passing the missing path to the AI provider. It does not silently fall back to the project root, because relocating the agent into the live checkout would widen its write scope without you asking for it. Before this check existed, the provider spawned into the missing directory and the failure surfaced as an unrelated error — `posix_spawn` reports a missing *working directory* as `ENOENT` against the *executable's* path, so Codex reported `No such file or directory (os error 2)` and Claude reported a libc/architecture mismatch. Neither named the directory.
+
+**Fix — follow the message:**
+
+1. **`/setproject <name>`** clears the stale override and rebinds the conversation to a project. This always works and is the suggestion you will always be offered.
+2. **`/worktree remove`** is offered *only* when the conversation is still bound to an isolation environment. It detaches and returns you to the project root. When the environment reference has already been cleared, this command reports `This conversation is not using a worktree.`, which is why it is not suggested in that state.
+
+The refusal writes nothing and changes no state, so a transient cause (a mount blip, a directory mid-move) costs one refused message and nothing else — the next turn re-evaluates from scratch. Operators can find these events in the logs under `orchestrator.conversation_cwd_missing`, which records the conversation id, the path, and the isolation environment id.

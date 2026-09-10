@@ -1,0 +1,227 @@
+import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { createMockQuery, createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+
+const mockQuery = createMockQuery();
+const mockLogError = mock(() => {});
+
+mock.module('./connection', () => ({
+  pool: { query: mockQuery },
+  getDialect: () => mockPostgresDialect,
+}));
+
+mock.module('@archon/paths', () => ({
+  createLogger: mock(() => ({
+    info: mock(() => {}),
+    warn: mock(() => {}),
+    error: mockLogError,
+    debug: mock(() => {}),
+    trace: mock(() => {}),
+    fatal: mock(() => {}),
+  })),
+}));
+
+import {
+  getUserAiPrefs,
+  setUserTiers,
+  setUserAliases,
+  setUserDefault,
+  clearUserAiPrefs,
+} from './user-ai-prefs-store';
+
+const USER = 'user-1';
+
+function prefsRow(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    id: 'row-1',
+    user_id: USER,
+    tiers: null,
+    aliases: null,
+    default_provider: null,
+    default_model: null,
+    created_at: '2026-06-11T00:00:00Z',
+    updated_at: '2026-06-11T00:00:00Z',
+    ...overrides,
+  };
+}
+
+describe('user-ai-prefs-store', () => {
+  beforeEach(() => {
+    mockQuery.mockClear();
+    mockLogError.mockClear();
+  });
+
+  describe('getUserAiPrefs', () => {
+    test('returns {} when no row exists', async () => {
+      const result = await getUserAiPrefs(USER);
+      expect(result).toEqual({});
+      expect(mockQuery.mock.calls[0][1]).toEqual([USER]);
+    });
+
+    test('parses JSON columns, default_provider, and default_model', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          prefsRow({
+            tiers: JSON.stringify({ large: { provider: 'claude', model: 'opus' } }),
+            aliases: JSON.stringify({ '@fast': { provider: 'codex', model: 'gpt-5.6-sol' } }),
+            default_provider: 'codex',
+            default_model: 'gpt-5.5',
+          }),
+        ])
+      );
+      const result = await getUserAiPrefs(USER);
+      expect(result).toEqual({
+        tiers: { large: { provider: 'claude', model: 'opus' } },
+        aliases: { '@fast': { provider: 'codex', model: 'gpt-5.6-sol' } },
+        defaultProvider: 'codex',
+        defaultModel: 'gpt-5.5',
+      });
+    });
+
+    test('omits fields that are NULL', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          prefsRow({ tiers: JSON.stringify({ small: { provider: 'claude', model: 'haiku' } }) }),
+        ])
+      );
+      const result = await getUserAiPrefs(USER);
+      expect(result.tiers).toEqual({ small: { provider: 'claude', model: 'haiku' } });
+      expect(result.aliases).toBeUndefined();
+      expect(result.defaultProvider).toBeUndefined();
+      expect(result.defaultModel).toBeUndefined();
+    });
+
+    test('treats a corrupt JSON column as unset', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([prefsRow({ tiers: '{not json' })]));
+      const result = await getUserAiPrefs(USER);
+      expect(result.tiers).toBeUndefined();
+    });
+
+    test.each(['tiers', 'aliases'] as const)(
+      'treats retired thinking in stored %s as unset without discarding other preferences',
+      async column => {
+        const otherColumn = column === 'tiers' ? 'aliases' : 'tiers';
+        const invalid =
+          column === 'tiers'
+            ? { medium: { provider: 'claude', model: 'sonnet', thinking: 'adaptive' } }
+            : { '@deep': { provider: 'claude', model: 'opus', thinking: 'adaptive' } };
+        const valid =
+          otherColumn === 'tiers'
+            ? { small: { provider: 'claude', model: 'haiku' } }
+            : { '@fast': { provider: 'codex', model: 'gpt-5.6-sol' } };
+        mockQuery.mockResolvedValueOnce(
+          createQueryResult([
+            prefsRow({
+              [column]: JSON.stringify(invalid),
+              [otherColumn]: JSON.stringify(valid),
+              default_provider: 'codex',
+              default_model: 'gpt-5.5',
+            }),
+          ])
+        );
+
+        const result = await getUserAiPrefs(USER);
+
+        expect(result[column]).toBeUndefined();
+        expect(result[otherColumn]).toEqual(valid);
+        expect(result.defaultProvider).toBe('codex');
+        expect(result.defaultModel).toBe('gpt-5.5');
+        const [{ err, column: loggedColumn }, event] = mockLogError.mock.calls.at(
+          -1
+        ) as unknown as [{ err: Error; column: string }, string];
+        expect(event).toBe('db.user_ai_prefs_validation_failed');
+        expect(loggedColumn).toBe(column);
+        expect(err.message).toMatch(/thinking.*effort:/);
+      }
+    );
+  });
+
+  describe('setUserTiers', () => {
+    test('merges patch into existing tiers and upserts', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          prefsRow({ tiers: JSON.stringify({ small: { provider: 'claude', model: 'haiku' } }) }),
+        ])
+      );
+      await setUserTiers(USER, { large: { provider: 'claude', model: 'opus' } });
+      const [sql, params] = mockQuery.mock.calls[1] as unknown as [string, unknown[]];
+      expect(sql).toContain('ON CONFLICT (user_id) DO UPDATE SET tiers');
+      expect(params[1]).toBe(USER);
+      expect(JSON.parse(params[2] as string)).toEqual({
+        small: { provider: 'claude', model: 'haiku' },
+        large: { provider: 'claude', model: 'opus' },
+      });
+    });
+
+    test('null unsets a tier; empty result persists NULL not {}', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          prefsRow({ tiers: JSON.stringify({ large: { provider: 'claude', model: 'opus' } }) }),
+        ])
+      );
+      await setUserTiers(USER, { large: null });
+      const [, params] = mockQuery.mock.calls[1] as unknown as [string, unknown[]];
+      expect(params[2]).toBeNull();
+    });
+  });
+
+  describe('setUserAliases', () => {
+    test('per-key merge with null-unset', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          prefsRow({
+            aliases: JSON.stringify({
+              '@fast': { provider: 'codex', model: 'gpt-5.6-sol' },
+              '@deep': { provider: 'claude', model: 'opus' },
+            }),
+          }),
+        ])
+      );
+      await setUserAliases(USER, {
+        '@fast': null,
+        '@new': { provider: 'pi', model: 'anthropic/claude-haiku-4-5' },
+      });
+      const [sql, params] = mockQuery.mock.calls[1] as unknown as [string, unknown[]];
+      expect(sql).toContain('ON CONFLICT (user_id) DO UPDATE SET aliases');
+      expect(JSON.parse(params[2] as string)).toEqual({
+        '@deep': { provider: 'claude', model: 'opus' },
+        '@new': { provider: 'pi', model: 'anthropic/claude-haiku-4-5' },
+      });
+    });
+  });
+
+  describe('setUserDefault', () => {
+    test('upserts default_provider and default_model atomically', async () => {
+      await setUserDefault(USER, 'codex', 'gpt-5.5');
+      const [sql, params] = mockQuery.mock.calls[0] as unknown as [string, unknown[]];
+      expect(sql).toContain(
+        'ON CONFLICT (user_id) DO UPDATE SET default_provider = $3, default_model = $4'
+      );
+      expect(params[1]).toBe(USER);
+      expect(params[2]).toBe('codex');
+      expect(params[3]).toBe('gpt-5.5');
+    });
+
+    test('provider without model clears any previous model pin', async () => {
+      await setUserDefault(USER, 'codex', null);
+      const [, params] = mockQuery.mock.calls[0] as unknown as [string, unknown[]];
+      expect(params[2]).toBe('codex');
+      expect(params[3]).toBeNull();
+    });
+
+    test('null clears both columns', async () => {
+      await setUserDefault(USER, null, null);
+      const [, params] = mockQuery.mock.calls[0] as unknown as [string, unknown[]];
+      expect(params[2]).toBeNull();
+      expect(params[3]).toBeNull();
+    });
+  });
+
+  describe('clearUserAiPrefs', () => {
+    test('deletes the row', async () => {
+      await clearUserAiPrefs(USER);
+      const [sql, params] = mockQuery.mock.calls[0] as unknown as [string, unknown[]];
+      expect(sql).toContain('DELETE FROM remote_agent_user_ai_prefs');
+      expect(params).toEqual([USER]);
+    });
+  });
+});

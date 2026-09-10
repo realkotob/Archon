@@ -79,6 +79,8 @@ About to test:
   Path:     brew (Homebrew tap on macOS)
   Version:  0.3.1 (expected)
   Cleanup:  will uninstall after tests (brew uninstall + untap)
+            If `archon-stable` symlink is detected in Phase 2, it will be
+            restored at the end of Phase 5 by reinstalling the tap formula.
 
 Proceed? (y/N)
 ```
@@ -112,6 +114,18 @@ gh release view v<version> --repo coleam00/Archon --json tagName,assets --jq '{t
 
 If the release does not exist or has no assets, abort with a clear message. Do not proceed to install a non-existent release.
 
+4. **Detect persistent `archon-stable` install (brew path only).** If the user has renamed a prior brew install to `archon-stable` (the dual-homebrew pattern — see `~/.config/fish/functions/brew-upgrade-archon.fish`), Phase 5's `brew uninstall` will wipe it. Capture the state so Phase 5b can restore it:
+
+```bash
+ARCHON_STABLE_WAS_INSTALLED=""
+if [ -L /opt/homebrew/bin/archon-stable ] || [ -L /usr/local/bin/archon-stable ]; then
+  ARCHON_STABLE_WAS_INSTALLED="yes"
+  echo "Detected persistent archon-stable — will restore after Phase 5 uninstall."
+fi
+```
+
+Export `ARCHON_STABLE_WAS_INSTALLED` into the environment used by Phase 5b. Only applies to the `brew` path — `curl-mac` and `curl-vps` don't go through brew and don't disturb `archon-stable`.
+
 ## Phase 3 — Install
 
 ### Path: brew
@@ -131,9 +145,20 @@ Install to a dedicated tmp directory so the dev `bun link` binary stays on PATH 
 ```bash
 INSTALL_DIR=/tmp/archon-test-release-$(date +%s)
 mkdir -p "$INSTALL_DIR"
-INSTALL_DIR="$INSTALL_DIR" curl -fsSL https://raw.githubusercontent.com/coleam00/Archon/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/coleam00/Archon/main/scripts/install.sh | INSTALL_DIR="$INSTALL_DIR" bash
 BINARY="$INSTALL_DIR/archon"
 ```
+
+> **The env var must prefix `bash`, not `curl`.** In `VAR=x cmd1 | cmd2` the
+> assignment applies only to `cmd1`, so `INSTALL_DIR=… curl … | bash` sets it for
+> the *download* and leaves the *installer* on its `/usr/local/bin` default. The
+> failure is confusing rather than obvious: the script downloads and verifies the
+> checksum, then demands sudo and dies with
+> `sudo: a terminal is required to read the password`. Observed on the 0.7.1 test.
+>
+> `scripts/install.sh` carries the same broken form in its own header example
+> (`INSTALL_DIR=~/.local/bin curl -fsSL ... | bash`), so users copying it hit this
+> too. Fix both together; see issue #2436.
 
 Verify `$BINARY` exists and is executable. Capture the install directory for cleanup.
 
@@ -222,7 +247,23 @@ git commit -q --allow-empty -m init
 
 ### Test 3 — SDK path works (assist workflow)
 
-In the same `$TESTREPO`:
+**Prerequisite.** Compiled binaries require Claude Code installed on the host and a configured binary path. Before running this test, ensure one of:
+
+```bash
+# Option A — env var (easy for ad-hoc testing)
+# After the native installer (Anthropic's default):
+export CLAUDE_BIN_PATH="$HOME/.local/bin/claude"
+# Or after npm global install:
+export CLAUDE_BIN_PATH="$(npm root -g)/@anthropic-ai/claude-code/cli.js"
+
+# Option B — config file (persistent)
+#   Add to ~/.archon/config.yaml:
+#   assistants:
+#     claude:
+#       claudeBinaryPath: /absolute/path/to/claude
+```
+
+Then in the same `$TESTREPO`:
 
 ```bash
 "$BINARY" workflow run assist "say hello and nothing else" 2>&1 | tee /tmp/archon-test-assist.log
@@ -232,14 +273,33 @@ In the same `$TESTREPO`:
 
 - Exit code 0
 - The Claude subprocess spawns successfully (no `spawn EACCES`, `ENOENT`, or `process exited with code 1` in the early output)
+- No `Claude Code CLI not found` error (that means the resolver rejected the configured path — verify the cli.js actually exists)
 - A response is produced (any response — even just "hello" — proves the SDK round-trip works)
 
 **Common failures:**
 
+- `Claude Code not found` → `CLAUDE_BIN_PATH` / `claudeBinaryPath` is unset or points at a non-existent file. Fix the path and re-run.
+- `Module not found "/Users/runner/..."` → regression of #1210: the resolver was bypassed and the SDK's `import.meta.url` fallback leaked a build-host path. Investigate `packages/providers/src/claude/provider.ts` and the resolver.
 - `Credit balance is too low` → auth is pointing at an exhausted API key (check `CLAUDE_USE_GLOBAL_AUTH` and `~/.archon/.env`)
 - `unable to determine transport target for "pino-pretty"` → #960 regression, binary crashes on TTY
 - `package.json not found (bad installation?)` → #961 regression, `isBinaryBuild` detection broken
 - Process exits before producing output → generic spawn failure, capture stderr
+
+### Test 3b — Resolver error path (run without `CLAUDE_BIN_PATH`)
+
+Quickly verify the resolver fails loud when nothing is configured:
+
+```bash
+(unset CLAUDE_BIN_PATH; "$BINARY" workflow run assist "hello" 2>&1 | tee /tmp/archon-test-no-path.log)
+```
+
+**Pass criteria (when no `~/.archon/config.yaml` configures `claudeBinaryPath`):**
+
+- Error message contains `Claude Code not found`
+- Error message mentions both `CLAUDE_BIN_PATH` and `claudeBinaryPath` as remediation options
+- No `Module not found` stack traces referencing the CI filesystem
+
+If you *do* have `claudeBinaryPath` set globally, skip this test or temporarily rename `~/.archon/config.yaml`.
 
 ### Test 4 — Env-leak gate refuses a leaky .env (optional, for releases including #1036/#1038/#983)
 
@@ -255,17 +315,58 @@ printf 'ANTHROPIC_API_KEY=sk-ant-test-fake\n' > .env
 "$BINARY" workflow run assist "hello" 2>&1 | tee /tmp/archon-test-leak.log
 ```
 
-**Pass criteria:**
+**Pass criteria** (current behaviour — the guard **strips**, it does not refuse):
 
-- The command exits with a non-zero code, OR produces an error message containing `Cannot add codebase` or `Cannot run workflow`
-- The error mentions the dangerous key name (`ANTHROPIC_API_KEY`)
-- No Claude subprocess was actually spawned (the gate short-circuited)
+- Output contains a strip line naming the repo and the source file, of the form:
+  `[archon] stripped N keys from <repo> (.env) to prevent target repo env from leaking into Archon processes`
+- `N` equals the number of keys planted (1 for the `.env` above) — a count of `0`
+  means the file was not read at all, which is a real regression
+- The workflow is then allowed to proceed and complete normally
+
+Assert on the strip line — pinned to **this** repo and **this** key count, so a
+strip from some other directory cannot produce a false pass. Capture the exit
+status too: under the strip design the workflow is expected to succeed, so a
+non-zero exit is its own failure.
+
+```bash
+"$BINARY" workflow run assist "hello" > /tmp/archon-test-leak.log 2>&1
+leak_exit=$?
+
+# $LEAKREPO may be a symlinked path (/tmp -> /private/tmp on macOS); the binary
+# logs the resolved form, so compare against that.
+resolved_repo=$(cd "$LEAKREPO" && pwd -P)
+expected="[archon] stripped 1 keys from ${resolved_repo} (.env) to prevent target repo env from leaking into Archon processes"
+
+if [ "$leak_exit" -ne 0 ]; then
+  echo "FAIL: workflow exited $leak_exit — the guard strips and proceeds, it should not abort"
+elif grep -qxF "$expected" /tmp/archon-test-leak.log; then
+  echo "PASS: env-leak guard stripped exactly the planted key from this repo"
+else
+  echo "FAIL: expected strip line absent. Got:"
+  grep -F '[archon] stripped' /tmp/archon-test-leak.log || echo "  (no strip line at all — guard inactive)"
+fi
+```
+
+An exact-match assertion is deliberate here. A looser pattern such as
+`stripped [1-9][0-9]* keys .*\.env` passes on **any** positive count from **any**
+path, so a strip belonging to a different repository — or a count inflated by an
+unrelated `.env` — reads as success while the regression it is meant to catch
+goes unnoticed.
+
+> **History — do not re-assert the old criteria.** This test previously expected a
+> *refusal* (`Cannot add codebase` / `Cannot run workflow`, non-zero exit), which
+> was the #1036/#1038/#983 behaviour. The current design is the two-layer strip
+> guard: the target repo's `.env` is read, dangerous keys are removed from the
+> environment handed to Archon subprocesses, and the run continues. On the 0.7.1
+> test the old assertions reported FAIL against a binary whose guard was working
+> correctly — it stripped exactly the 1 planted key. Verify the security property
+> (the key never reaches the subprocess), not the obsolete remediation text.
 
 **Common failures:**
 
-- Command proceeds normally → the env-leak gate is not active (regression of #1036)
-- Error is generic or unclear → the context-aware error message from #983 has regressed
-- Gate blocks but with wrong remediation text → `formatLeakError` context detection is broken
+- No strip line at all → the guard is not active; the `.env` is reaching subprocesses
+- `stripped 0 keys` → the file was located but not parsed
+- Strip line names the wrong file or repo → path resolution regression
 
 Clean up the leak test repo:
 
@@ -316,6 +417,25 @@ which -a archon
 archon version | head -1
 # should match the dev version captured in Phase 2
 ```
+
+**Restore `archon-stable` if it existed before the test** (dual-homebrew pattern — see Phase 2 item 4):
+
+```bash
+if [ -n "$ARCHON_STABLE_WAS_INSTALLED" ]; then
+  echo "Restoring archon-stable (detected before test)..."
+  brew tap coleam00/archon
+  brew install coleam00/archon/archon
+  BREW_BIN="$(brew --prefix)/bin"
+  if [ -e "$BREW_BIN/archon" ]; then
+    mv "$BREW_BIN/archon" "$BREW_BIN/archon-stable"
+    echo "archon-stable restored: $(archon-stable version 2>/dev/null | head -1)"
+  else
+    echo "WARNING: brew install succeeded but $BREW_BIN/archon missing — check formula"
+  fi
+fi
+```
+
+> **Note on the restored version**: this reinstalls from whatever the tap currently ships, which is typically the release you just tested (so `archon-stable` ends up at the newly-tested version). That's usually what the operator wants — you just verified the new release works, and you want `archon-stable` pointed at it. If you were testing an older version for back-version QA, the restored `archon-stable` will be the *current* tap formula, not the pre-test version. For that rare case, the operator should re-run `brew-upgrade-archon` manually after the test.
 
 ### Path: curl-mac
 

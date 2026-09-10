@@ -1,9 +1,9 @@
 import { mock, describe, test, expect, beforeEach } from 'bun:test';
 import { ZodError } from 'zod';
-import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+import { createMockQuery, createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import { Session, SessionMetadata, sessionMetadataSchema } from '../types';
 
-const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockQuery = createMockQuery();
 const mockWithTransaction = mock(
   async <T>(fn: (query: typeof mockQuery) => Promise<T>): Promise<T> => {
     return fn(mockQuery);
@@ -168,7 +168,18 @@ describe('sessions', () => {
       );
     });
 
-    test('throws SessionNotFoundError when session does not exist', async () => {
+    test('sets assistant_session_id to NULL when called with null', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateSession('session-123', null);
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        'UPDATE remote_agent_sessions SET assistant_session_id = $1 WHERE id = $2',
+        [null, 'session-123']
+      );
+    });
+
+    test('throws SessionNotFoundError when session does not exist (updateSession)', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 0)); // rowCount = 0
 
       const error = await updateSession('non-existent', 'new-session-id').catch(e => e);
@@ -192,11 +203,11 @@ describe('sessions', () => {
     test('stores the provided reason in ended_reason', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
-      await deactivateSession('session-123', 'cwd-changed');
+      await deactivateSession('session-123', 'isolation-changed');
 
       expect(mockQuery).toHaveBeenCalledWith(
         'UPDATE remote_agent_sessions SET active = false, ended_at = NOW(), ended_reason = $2 WHERE id = $1',
-        ['session-123', 'cwd-changed']
+        ['session-123', 'isolation-changed']
       );
     });
 

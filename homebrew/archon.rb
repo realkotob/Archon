@@ -7,28 +7,28 @@
 class Archon < Formula
   desc "Remote agentic coding platform - control AI assistants from anywhere"
   homepage "https://github.com/coleam00/Archon"
-  version "0.3.6"
+  version "0.10.1"
   license "MIT"
 
   on_macos do
     on_arm do
       url "https://github.com/coleam00/Archon/releases/download/v#{version}/archon-darwin-arm64"
-      sha256 "96b6dac50b046eece9eddbb988a0c39b4f9a0e2faac66e49b977ba6360069e86"
+      sha256 "61aa2430198c27b2b3fcc97890c8e4b73b0c7cc99e417930ddb4b1f8c59e6933"
     end
     on_intel do
       url "https://github.com/coleam00/Archon/releases/download/v#{version}/archon-darwin-x64"
-      sha256 "09f1dbe12417b4300b7b07b531eb7391a286305f8d4eafc11e7f61f5d26eb8eb"
+      sha256 "f4766a8bcb9ab6e688ad6d38b4019cdb84ccce5f6701bfa8e56dfbb9f8ca6cee"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/coleam00/Archon/releases/download/v#{version}/archon-linux-arm64"
-      sha256 "80b06a6ff699ec57cd4a3e49cfe7b899a3e8212688d70285f5a887bf10086731"
+      sha256 "9b8acd643a224385dc511c8d77400e31166e7e5c5579eb0335ed56e3434d4bff"
     end
     on_intel do
       url "https://github.com/coleam00/Archon/releases/download/v#{version}/archon-linux-x64"
-      sha256 "09f5dac6db8037ed6f3e5b7e9c5eb8e37f19822a4ed2bf4cd7e654780f9d00de"
+      sha256 "7aa8b25a4b0017dddb05aead518cbd453ca8db9c54ac4a7611f40164fecd3973"
     end
   end
 

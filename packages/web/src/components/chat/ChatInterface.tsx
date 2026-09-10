@@ -26,8 +26,11 @@ import type {
   FileAttachment,
   ToolCallDisplay,
   ErrorDisplay,
+  TextEventMeta,
   WorkflowDispatchEvent,
 } from '@/lib/types';
+import { applyOnText } from '@/lib/chat-message-reducer';
+import { applySystemStatus } from '@/lib/system-status-reducer';
 import {
   getCachedMessages,
   setCachedMessages,
@@ -36,6 +39,7 @@ import {
 } from '@/lib/message-cache';
 import { useProject } from '@/contexts/ProjectContext';
 import { ensureUtc } from '@/lib/format';
+import { resolveChatHeaderPath } from '@/lib/chat-header';
 
 function mapMessageRow(row: MessageResponse): ChatMessage {
   let meta: {
@@ -97,9 +101,13 @@ function mapMessageRow(row: MessageResponse): ChatMessage {
 
 interface ChatInterfaceProps {
   conversationId: string;
+  cwdOverride?: string | null;
 }
 
-export function ChatInterface({ conversationId }: ChatInterfaceProps): React.ReactElement {
+export function ChatInterface({
+  conversationId,
+  cwdOverride,
+}: ChatInterfaceProps): React.ReactElement {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { selectedProjectId } = useProject();
@@ -134,6 +142,8 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
   });
   // Default to true (hide button) until server confirms non-Docker — prevents broken vscode:// links
   const isDocker = health?.is_docker ?? true;
+  const isWsl = health?.is_wsl ?? false;
+  const wslDistro = health?.wsl_distro;
 
   // Sync messages to cache for persistence across navigation
   useEffect(() => {
@@ -236,7 +246,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
     const latestId = ids[ids.length - 1];
     void getWorkflowRunByWorker(latestId)
       .then(result => {
-        if (!result) return;
+        if (!result?.run) return;
         const run = result.run;
         hydrateWorkflow({
           runId: run.id,
@@ -276,88 +286,19 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
       ? codebases?.find(cb => cb.id === selectedProjectId)
       : undefined;
   const headerTitle = currentConv?.title ?? 'Chat';
-  const headerSubtitle = currentConv?.cwd ?? undefined;
+  const headerSubtitle = resolveChatHeaderPath(currentConv?.cwd, cwdOverride);
 
   const nextId = (): string => {
     messageIdCounter.current += 1;
     return `msg-${String(messageIdCounter.current)}`;
   };
 
-  const onText = useCallback(
-    (content: string, workflowResult?: { workflowName: string; runId: string }): void => {
-      // First AI text received — the thinking placeholder is about to gain content,
-      // so the hydration merge no longer needs the sendInFlight guard.
-      setSendInFlight(false);
-      setMessages(prev => {
-        const last = prev[prev.length - 1];
-        // Workflow status messages (🚀 start, ✅ complete) should always be their own message
-        const isWorkflowStatus = /^[\u{1F680}\u{2705}]/u.test(content);
-
-        // Workflow result messages always start as a new message.
-        // Dedup: SSETransport replays buffered events on reconnect, which can
-        // arrive after the DB-fetch merge has already run — skip if a message
-        // with the same runId is already in state.
-        if (workflowResult) {
-          if (prev.some(m => m.workflowResult?.runId === workflowResult.runId)) {
-            return prev;
-          }
-          const updated =
-            last?.role === 'assistant' && last.isStreaming
-              ? [...prev.slice(0, -1), { ...last, isStreaming: false }]
-              : [...prev];
-          return [
-            ...updated,
-            {
-              id: `msg-${String(Date.now())}`,
-              role: 'assistant' as const,
-              content,
-              timestamp: Date.now(),
-              isStreaming: false,
-              toolCalls: [],
-              workflowResult,
-            },
-          ];
-        }
-
-        if (last?.role === 'assistant' && last.isStreaming) {
-          const lastIsWorkflowStatus = /^[\u{1F680}\u{2705}]/u.test(last.content);
-
-          if ((isWorkflowStatus && last.content) || (lastIsWorkflowStatus && !isWorkflowStatus)) {
-            // Close the current streaming message and start a new one when:
-            // 1. Incoming is a workflow status and current has content
-            // 2. Current is a workflow status and incoming is regular text
-            return [
-              ...prev.slice(0, -1),
-              { ...last, isStreaming: false },
-              {
-                id: `msg-${String(Date.now())}`,
-                role: 'assistant' as const,
-                content,
-                timestamp: Date.now(),
-                isStreaming: true,
-                toolCalls: [],
-              },
-            ];
-          }
-          // Append to existing streaming message (replace thinking placeholder if empty)
-          return [...prev.slice(0, -1), { ...last, content: last.content + content }];
-        }
-        // New assistant message
-        return [
-          ...prev,
-          {
-            id: `msg-${String(Date.now())}`,
-            role: 'assistant' as const,
-            content,
-            timestamp: Date.now(),
-            isStreaming: true,
-            toolCalls: [],
-          },
-        ];
-      });
-    },
-    []
-  );
+  const onText = useCallback((content: string, meta?: TextEventMeta): void => {
+    // First AI text received — the thinking placeholder is about to gain content,
+    // so the hydration merge no longer needs the sendInFlight guard.
+    setSendInFlight(false);
+    setMessages(prev => applyOnText(prev, content, undefined, undefined, meta));
+  }, []);
 
   const onToolCall = useCallback(
     (name: string, input: Record<string, unknown>, toolCallId?: string): void => {
@@ -511,21 +452,43 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           .then((rows: MessageResponse[]) => {
             if (rows.length === 0) return;
             const hydrated = rows.map(mapMessageRow);
-            // Preserve client-only system messages (e.g., sync status) when rehydrating
+            // Merge hydrated DB messages with client-only state (system, live SSE) to
+            // avoid losing messages that exist only on the client.
             setMessages(prev => {
-              const systemMessages = prev.filter(m => m.role === 'system');
-              if (systemMessages.length === 0) return hydrated;
-              // Interleave system messages at their original positions by timestamp
+              const hydratedIds = new Set(hydrated.map(m => m.id));
+              // Keep only meaningful client-only messages not present in hydrated set.
+              // Exclude optimistic user rows and empty thinking placeholders.
+              const clientOnly = prev.filter(m => {
+                if (hydratedIds.has(m.id)) return false;
+                if (m.role === 'system') return true;
+                if (m.role !== 'assistant') return false;
+                return (
+                  Boolean(m.content) ||
+                  Boolean(m.error) ||
+                  Boolean(m.workflowDispatch) ||
+                  Boolean(m.workflowResult) ||
+                  Boolean(m.toolCalls?.length)
+                );
+              });
+              if (clientOnly.length === 0) return hydrated;
+              // Interleave client-only messages at their original positions by timestamp
               const merged = [...hydrated];
-              for (const sys of systemMessages) {
-                const insertIdx = merged.findIndex(m => m.timestamp > sys.timestamp);
-                if (insertIdx === -1) merged.push(sys);
-                else merged.splice(insertIdx, 0, sys);
+              for (const msg of clientOnly) {
+                const insertIdx = merged.findIndex(m => m.timestamp > msg.timestamp);
+                if (insertIdx === -1) merged.push(msg);
+                else merged.splice(insertIdx, 0, msg);
               }
               return merged;
             });
           })
-          .catch(() => {
+          .catch((err: unknown) => {
+            console.error(
+              '[Chat] Re-fetch after SSE reconnect failed — clearing stuck placeholder',
+              {
+                conversationId: conversationIdRef.current,
+                error: err instanceof Error ? err.message : err,
+              }
+            );
             // Re-fetch failed — clear stuck placeholder so user can retry
             setMessages(prev =>
               prev.map(m => (m.isStreaming && !m.content ? { ...m, isStreaming: false } : m))
@@ -606,15 +569,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
   );
 
   const onSystemStatus = useCallback((content: string): void => {
-    setMessages(prev => [
-      ...prev,
-      {
-        id: nextId(),
-        role: 'system' as const,
-        content,
-        timestamp: Date.now(),
-      },
-    ]);
+    setMessages(prev => applySystemStatus(prev, content, nextId));
   }, []);
 
   const { connected } = useSSE(isNewChat ? null : conversationId, {
@@ -678,7 +633,7 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
           // Cache messages under the new ID so the remounted ChatInterface picks them up
           // (navigate changes the key prop, causing unmount/remount — state is lost otherwise)
           setCachedMessages(newId, [userMsg, thinkingMsg]);
-          navigate(`/chat/${newId}`, { replace: true });
+          navigate(`/legacy/chat/${newId}`, { replace: true });
           // Trigger title + workflow refreshes after AI generates a proper title
           if (!hasTriggeredTitleRefresh.current && !message.startsWith('/')) {
             hasTriggeredTitleRefresh.current = true;
@@ -753,6 +708,8 @@ export function ChatInterface({ conversationId }: ChatInterfaceProps): React.Rea
         projectName={currentCodebase?.name ?? contextCodebase?.name}
         connected={isNewChat ? undefined : connected}
         isDocker={isDocker}
+        isWsl={isWsl}
+        wslDistro={wslDistro}
       />
       {(conversationsError || codebasesError) && (
         <div className="flex gap-2 px-4 py-1">

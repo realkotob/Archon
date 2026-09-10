@@ -11,11 +11,16 @@ import {
   listCodebases,
   listProviders,
   addCodebase,
+  getCodebaseInput,
   deleteCodebase,
   updateAssistantConfig,
   getCodebaseEnvVars,
   setCodebaseEnvVar,
   deleteCodebaseEnvVar,
+  getGithubConnection,
+  startGithubDeviceFlow,
+  pollGithubDeviceFlow,
+  disconnectGithub,
 } from '@/lib/api';
 import type {
   SafeConfigResponse,
@@ -23,6 +28,7 @@ import type {
   ProviderDefaults,
   ProviderInfo,
 } from '@/lib/api';
+import { effortOptionsForAgent } from '@/experiments/console/lib/model-options';
 
 const selectClass =
   'h-9 rounded-md border border-border bg-surface-elevated text-text-primary px-3 text-sm focus:outline-none focus:ring-1 focus:ring-ring [&>option]:bg-surface-elevated [&>option]:text-text-primary';
@@ -258,7 +264,7 @@ function EnvVarsPanel({ codebaseId }: { codebaseId: string }): React.ReactElemen
 
 function ProjectsSection(): React.ReactElement {
   const queryClient = useQueryClient();
-  const [addPath, setAddPath] = useState('');
+  const [addValue, setAddValue] = useState('');
   const [showAdd, setShowAdd] = useState(false);
   const [expandedEnvVars, setExpandedEnvVars] = useState<string | null>(null);
 
@@ -268,10 +274,10 @@ function ProjectsSection(): React.ReactElement {
   });
 
   const addMutation = useMutation({
-    mutationFn: ({ path }: { path: string }) => addCodebase({ path }),
+    mutationFn: (value: string) => addCodebase(getCodebaseInput(value)),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['codebases'] });
-      setAddPath('');
+      setAddValue('');
       setShowAdd(false);
     },
   });
@@ -285,8 +291,8 @@ function ProjectsSection(): React.ReactElement {
 
   function handleAddSubmit(e: React.FormEvent): void {
     e.preventDefault();
-    if (addPath.trim()) {
-      addMutation.mutate({ path: addPath.trim() });
+    if (addValue.trim()) {
+      addMutation.mutate(addValue.trim());
     }
   }
 
@@ -339,11 +345,11 @@ function ProjectsSection(): React.ReactElement {
         {showAdd ? (
           <form onSubmit={handleAddSubmit} className="mt-3 flex gap-2">
             <Input
-              value={addPath}
+              value={addValue}
               onChange={e => {
-                setAddPath(e.target.value);
+                setAddValue(e.target.value);
               }}
-              placeholder="/path/to/repository"
+              placeholder="GitHub URL or local path"
               className="flex-1"
             />
             <Button type="submit" size="sm" disabled={addMutation.isPending}>
@@ -355,7 +361,7 @@ function ProjectsSection(): React.ReactElement {
               size="sm"
               onClick={() => {
                 setShowAdd(false);
-                setAddPath('');
+                setAddValue('');
               }}
             >
               Cancel
@@ -530,7 +536,7 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
                       onChange={e => {
                         updateProviderSettings('codex', { model: e.target.value });
                       }}
-                      placeholder="gpt-5.3-codex"
+                      placeholder="gpt-5.6-sol"
                     />
 
                     <label htmlFor="reasoning">Reasoning Effort</label>
@@ -546,11 +552,11 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
                       }}
                       className={selectClass}
                     >
-                      <option value="minimal">minimal</option>
-                      <option value="low">low</option>
-                      <option value="medium">medium</option>
-                      <option value="high">high</option>
-                      <option value="xhigh">xhigh</option>
+                      {effortOptionsForAgent('codex', providers ?? [])?.map(effort => (
+                        <option key={effort} value={effort}>
+                          {effort}
+                        </option>
+                      ))}
                     </select>
 
                     <label htmlFor="web-search">Web Search</label>
@@ -606,16 +612,19 @@ function AssistantConfigSection({ config }: { config: SafeConfigResponse }): Rea
 }
 
 function PlatformConnectionsSection({
-  adapter,
+  activePlatforms,
 }: {
-  adapter: string | undefined;
+  activePlatforms: string[] | undefined;
 }): React.ReactElement {
+  const active = new Set(activePlatforms ?? []);
   const platforms = [
-    { name: 'Web', connected: adapter === 'web' },
-    { name: 'Slack', connected: false },
-    { name: 'Telegram', connected: false },
-    { name: 'Discord', connected: false },
-    { name: 'GitHub', connected: false },
+    { name: 'Web', connected: active.has('Web') },
+    { name: 'Slack', connected: active.has('Slack') },
+    { name: 'Telegram', connected: active.has('Telegram') },
+    { name: 'Discord', connected: active.has('Discord') },
+    { name: 'GitHub', connected: active.has('GitHub') },
+    { name: 'Gitea', connected: active.has('Gitea') },
+    { name: 'GitLab', connected: active.has('GitLab') },
   ];
 
   return (
@@ -633,6 +642,131 @@ function PlatformConnectionsSection({
               </Badge>
             </div>
           ))}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Connect / disconnect the current web user's GitHub identity via the device
+ * flow. The browser polls the server (which proxies a single device-flow poll
+ * per call) at the server-supplied interval until connected, expired, or denied.
+ */
+function GithubIdentitySection(): React.ReactElement {
+  const queryClient = useQueryClient();
+  const { data: status } = useQuery({
+    queryKey: ['github-connection'],
+    queryFn: getGithubConnection,
+    // 401 (web auth not configured) → treat as "unavailable", don't spam retries
+    retry: false,
+  });
+
+  const [userCode, setUserCode] = useState<string | null>(null);
+  const [verificationUri, setVerificationUri] = useState<string | null>(null);
+  const [phase, setPhase] = useState<'idle' | 'pending' | 'error'>('idle');
+  const [message, setMessage] = useState<string | null>(null);
+
+  const connect = useMutation({
+    mutationFn: async (): Promise<void> => {
+      setPhase('pending');
+      setMessage(null);
+      const start = await startGithubDeviceFlow();
+      setUserCode(start.user_code);
+      setVerificationUri(start.verification_uri);
+      const deadline = Date.now() + start.expires_in * 1000;
+      let interval = Math.max(1, start.interval);
+      // Poll until terminal. Each poll is one server-side device-flow check.
+      for (;;) {
+        if (Date.now() > deadline) throw new Error('Device code expired — try again.');
+        await new Promise(r => setTimeout(r, interval * 1000));
+        const res = await pollGithubDeviceFlow(start.device_code);
+        if (res.status === 'connected') return;
+        if (res.status === 'pending') continue;
+        if (res.status === 'expired') throw new Error('Device code expired — try again.');
+        if (res.status === 'denied') throw new Error('Authorization was denied.');
+        // 'error' — back off slightly and surface detail
+        interval += 2;
+        if (res.detail) throw new Error(`GitHub connect failed: ${res.detail}`);
+      }
+    },
+    onSuccess: () => {
+      setPhase('idle');
+      setUserCode(null);
+      setVerificationUri(null);
+      void queryClient.invalidateQueries({ queryKey: ['github-connection'] });
+    },
+    onError: (err: Error) => {
+      setPhase('error');
+      setUserCode(null);
+      setVerificationUri(null);
+      setMessage(err.message);
+    },
+  });
+
+  const disconnect = useMutation({
+    mutationFn: disconnectGithub,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['github-connection'] });
+    },
+  });
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>GitHub Identity</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="space-y-3 text-sm">
+          {status?.connected ? (
+            <div className="flex items-center justify-between">
+              <span>
+                Connected as <span className="font-medium">@{status.githubLogin}</span>
+              </span>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={disconnect.isPending}
+                onClick={() => {
+                  disconnect.mutate();
+                }}
+              >
+                Disconnect
+              </Button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between">
+              <span className="text-muted-foreground">
+                Connect your GitHub account so PR comments and commits attribute to you.
+              </span>
+              <Button
+                size="sm"
+                disabled={connect.isPending}
+                onClick={() => {
+                  connect.mutate();
+                }}
+              >
+                {connect.isPending ? 'Connecting…' : 'Connect GitHub'}
+              </Button>
+            </div>
+          )}
+
+          {phase === 'pending' && userCode && verificationUri && (
+            <div className="rounded-md border border-border bg-muted/40 p-3">
+              Visit{' '}
+              <a
+                href={verificationUri}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline"
+              >
+                {verificationUri}
+              </a>{' '}
+              and enter code: <span className="font-mono font-semibold">{userCode}</span>
+            </div>
+          )}
+
+          {phase === 'error' && message && <div className="text-destructive">{message}</div>}
         </div>
       </CardContent>
     </Card>
@@ -716,7 +850,11 @@ export function SettingsPage(): React.ReactElement {
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
             {configData && <AssistantConfigSection config={configData.config} />}
-            <PlatformConnectionsSection adapter={health?.adapter} />
+            <PlatformConnectionsSection activePlatforms={health?.activePlatforms} />
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+            <GithubIdentitySection />
           </div>
 
           <ProjectsSection />

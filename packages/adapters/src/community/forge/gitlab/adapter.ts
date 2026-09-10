@@ -14,19 +14,26 @@ import {
   classifyAndFormatError,
   toError,
   onConversationClosed,
-  ConversationLockManager,
+  type ConversationLockManager,
 } from '@archon/core';
-import { getArchonWorkspacesPath, getCommandFolderSearchPaths, createLogger } from '@archon/paths';
+import {
+  ensureProjectStructure,
+  getCommandFolderSearchPaths,
+  getProjectSourcePath,
+  createLogger,
+} from '@archon/paths';
 import {
   syncRepository,
   addSafeDirectory,
   toRepoPath,
   toBranchName,
   isWorktreePath,
-  execFileAsync,
+  cloneRepository,
 } from '@archon/git';
 import * as db from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
+import * as userDb from '@archon/core/db/users';
+import { resolveDefaultAssistant } from '@archon/core/config/resolve-assistant';
 import { parseAllowedUsers, isGitLabUserAuthorized, verifyWebhookToken } from './auth';
 import { splitIntoParagraphChunks } from '../../../utils/message-splitting';
 import type { GitLabWebhookEvent, GitLabIssue, GitLabMergeRequest } from './types';
@@ -43,18 +50,20 @@ const MAX_LENGTH = 65000; // Practical limit for GitLab notes
 /** Hidden marker added to bot comments to prevent self-triggering loops */
 const BOT_RESPONSE_MARKER = '<!-- archon-bot-response -->';
 
+type ConversationLocker = Pick<ConversationLockManager, 'acquireLock'>;
+
 export class GitLabAdapter implements IPlatformAdapter {
   private readonly gitlabUrl: string;
   private readonly token: string;
   private readonly webhookSecret: string;
   private readonly allowedUsers: string[];
   private readonly botMention: string;
-  private readonly lockManager: ConversationLockManager;
+  private readonly lockManager: ConversationLocker;
 
   constructor(
     token: string,
     webhookSecret: string,
-    lockManager: ConversationLockManager,
+    lockManager: ConversationLocker,
     gitlabUrl?: string,
     botMention?: string
   ) {
@@ -452,51 +461,42 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
       return;
     }
 
-    // Clone the repository
-    // GitLab self-hosted instances need oauth2:token auth and credential helper disabled
-    // to prevent macOS Keychain from intercepting and blocking the clone
     getLog().info({ projectPath, repoPath }, 'gitlab.repo_cloning');
 
+    // Create project structure (source/, worktrees/, artifacts/, logs/) before
+    // cloning so worktree paths resolve correctly on first webhook clone.
+    // For nested namespaces (group/subgroup/repo), the namespace becomes the
+    // owner and the leaf segment becomes the repo.
+    const cloneSegments = projectPath.split('/');
+    const cloneRepo = cloneSegments[cloneSegments.length - 1];
+    const cloneOwner = cloneSegments.slice(0, -1).join('/');
+    await ensureProjectStructure(cloneOwner, cloneRepo);
+
     const urlObj = new URL(this.gitlabUrl);
-    const repoUrl = `${urlObj.protocol}//oauth2:${this.token}@${urlObj.host}/${projectPath}.git`;
+    const repoUrl = `${urlObj.protocol}//${urlObj.host}/${projectPath}.git`;
+    const cloneResult = await cloneRepository(repoUrl, toRepoPath(repoPath), {
+      credentials: { username: 'oauth2', password: this.token },
+    });
 
-    try {
-      await execFileAsync('git', ['-c', 'credential.helper=', 'clone', repoUrl, repoPath], {
-        timeout: 120000,
-      });
-    } catch (error) {
-      const err = error as Error;
-      // Sanitize token from all error properties (message, stack, cause)
-      const sanitize = (s: string): string => s.replaceAll(this.token, '***');
-      const sanitized = sanitize(err.message);
-      const msg = sanitized.toLowerCase();
+    if (!cloneResult.ok) {
+      getLog().error(
+        { projectPath, repoPath, error: cloneResult.error },
+        'gitlab.repo_clone_failed'
+      );
 
-      const sanitizedError: Record<string, unknown> = { message: sanitized };
-      if (err.stack) sanitizedError.stack = sanitize(err.stack);
-      if (err.cause && typeof (err.cause as Error).message === 'string') {
-        sanitizedError.cause = sanitize((err.cause as Error).message);
-      }
-      const errRecord = err as unknown as Record<string, unknown>;
-      if (typeof errRecord.stdout === 'string') sanitizedError.stdout = sanitize(errRecord.stdout);
-      if (typeof errRecord.stderr === 'string') sanitizedError.stderr = sanitize(errRecord.stderr);
-
-      getLog().error({ projectPath, repoPath, error: sanitizedError }, 'gitlab.repo_clone_failed');
-
-      if (msg.includes('not found') || msg.includes('404')) {
+      if (cloneResult.error.code === 'not_a_repo') {
         throw new Error(
           `Repository ${projectPath} not found or is private. Check repository access.`
         );
       }
-      if (
-        msg.includes('authentication failed') ||
-        msg.includes('could not read') ||
-        msg.includes('403')
-      ) {
+      if (cloneResult.error.code === 'permission_denied') {
         throw new Error(
           `Authentication failed for ${projectPath}. Check GITLAB_TOKEN permissions.`
         );
       }
-      throw new Error(`Failed to clone ${projectPath}: ${sanitized}`);
+      const detail =
+        cloneResult.error.code === 'unknown' ? cloneResult.error.message : cloneResult.error.code;
+      throw new Error(`Failed to clone ${projectPath}: ${detail}`);
     }
 
     await addSafeDirectory(toRepoPath(repoPath));
@@ -546,7 +546,15 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
     let existing = await codebaseDb.findCodebaseByRepoUrl(repoUrlNoGit);
     existing ??= await codebaseDb.findCodebaseByRepoUrl(repoUrlWithGit);
 
-    const canonicalPath = join(getArchonWorkspacesPath(), ...projectPath.split('/'));
+    // Canonical path uses the project source/ subdirectory so that worktrees/,
+    // artifacts/, and logs/ live as siblings of the cloned repo (not nested
+    // inside it). For nested GitLab namespaces (group/subgroup/repo), the
+    // namespace becomes the owner, the leaf segment becomes the repo. Mirrors
+    // the CLI /clone path; see issue #1547.
+    const segments = projectPath.split('/');
+    const gitlabRepo = segments[segments.length - 1];
+    const gitlabOwner = segments.slice(0, -1).join('/');
+    const canonicalPath = getProjectSourcePath(gitlabOwner, gitlabRepo);
 
     if (existing) {
       const looksLikeWorktreePath = existing.default_cwd.includes('/worktrees/');
@@ -570,6 +578,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
       name: projectPath,
       repository_url: repoUrlNoGit,
       default_cwd: canonicalPath,
+      ai_assistant_type: await resolveDefaultAssistant(canonicalPath),
     });
 
     getLog().info({ codebaseName: codebase.name, path: canonicalPath }, 'gitlab.codebase_created');
@@ -663,9 +672,28 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
 
     getLog().info({ eventType, projectPath, iid, isMR }, 'gitlab.webhook_processing');
 
-    // Steps 7-13 wrapped in try-catch so user gets error feedback on setup failures
+    // Resolution failure must not drop the webhook — warn-log and continue with
+    // archonUserId undefined so the conversation/run rows fall back to NULL.
+    let archonUserId: string | undefined;
+    if (senderUsername) {
+      try {
+        const user = await userDb.findOrCreateUserByPlatformIdentity(
+          'gitlab',
+          senderUsername,
+          senderUsername
+        );
+        archonUserId = user.id;
+      } catch (err) {
+        getLog().warn(
+          { err: toError(err), gitlabUsername: senderUsername },
+          'gitlab.user_resolve_failed'
+        );
+      }
+    }
+
+    // Steps 8-14 wrapped in try-catch so user gets error feedback on setup failures
     try {
-      // 7. Conversation + codebase setup
+      // 8. Conversation + codebase setup
       const conversationId = this.buildConversationId(projectPath, iid, isMR);
       const existingConv = await db.getOrCreateConversation('gitlab', conversationId);
       const isNewConversation = !existingConv.codebase_id;
@@ -694,18 +722,18 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         }
       }
 
-      // 8. Get default branch
+      // 9. Get default branch
       const defaultBranch = event.project.default_branch;
 
-      // 9. Ensure repo ready
+      // 10. Ensure repo ready
       await this.ensureRepoReady(projectPath, defaultBranch, repoPath, isNewCodebase);
 
-      // 10. Auto-load commands
+      // 11. Auto-load commands
       if (isNewCodebase) {
         await this.autoDetectAndLoadCommands(repoPath, codebase.id);
       }
 
-      // 11. Isolation hints
+      // 12. Isolation hints
       const isolationHints: IsolationHints = {
         workflowType: isMR ? 'pr' : 'issue',
         workflowId: String(iid),
@@ -725,7 +753,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         );
       }
 
-      // 12. Build message with context
+      // 13. Build message with context
       const strippedComment = this.stripMention(comment);
       let finalMessage = strippedComment;
       let contextToAppend: string | undefined;
@@ -751,7 +779,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
         }
       }
 
-      // 13. Thread context + dispatch
+      // 14. Thread context + dispatch
       const commentHistory = await this.fetchCommentHistory(projectPath, iid, isMR);
       const threadContext = commentHistory.length > 0 ? commentHistory.join('\n') : undefined;
       getLog().debug(
@@ -765,6 +793,7 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
             issueContext: contextToAppend,
             threadContext,
             isolationHints,
+            userId: archonUserId,
           });
         } catch (error) {
           const err = toError(error);

@@ -2,12 +2,37 @@
  * Frontend-specific types for the Archon Web UI.
  * SSE event types match what the Web adapter emits.
  */
-
 import type { components } from '@/lib/api.generated';
 
-export type WorkflowRunStatus = components['schemas']['WorkflowRunStatus'];
+export type WorkflowRunStatus =
+  | 'pending'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'paused';
 export type WorkflowStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
 export type ArtifactType = 'pr' | 'commit' | 'file_created' | 'file_modified' | 'branch';
+export type SkipCause = components['schemas']['SkipCause'];
+export type NodeSkipReason = components['schemas']['NodeSkipReason'];
+
+/**
+ * Framework category the server attaches to a message it emitted itself (as
+ * opposed to the agent's own prose). Mirrors `MessageMetadata['category']` in
+ * `@archon/core` — `@archon/web` is a client package and cannot import from a
+ * server package, so the union is restated here.
+ *
+ * An unrecognized value is a wider server, not an error: TypeScript does not
+ * narrow at runtime, and every consumer asks a predicate ("is this a workflow
+ * status?") rather than switching exhaustively, so a new category degrades to
+ * ordinary prose.
+ */
+export type MessageCategory =
+  | 'tool_call_formatted'
+  | 'workflow_status'
+  | 'workflow_dispatch_status'
+  | 'isolation_context'
+  | 'workflow_result';
 
 // Base SSE event
 interface BaseSSEEvent {
@@ -20,7 +45,18 @@ export interface TextEvent extends BaseSSEEvent {
   type: 'text';
   content: string;
   isComplete: boolean;
+  /** Present only on server-emitted framework messages; absent for agent prose. */
+  category?: MessageCategory;
+  /** Present only on `workflow_result` messages — identifies the finished run. */
+  workflowResult?: { workflowName: string; runId: string };
 }
+
+/**
+ * The non-text fields of a `text` SSE event, as handed to an `onText` handler.
+ * `useSSE` batches text over a 50 ms window, so this describes the flushed
+ * segment rather than any single event.
+ */
+export type TextEventMeta = Pick<TextEvent, 'category' | 'workflowResult'>;
 
 // Tool call started
 export interface ToolCallEvent extends BaseSSEEvent {
@@ -110,16 +146,7 @@ export interface LoopIterationEvent extends BaseSSEEvent {
 }
 
 // DAG node status (emitted during DAG workflow execution)
-export interface DagNodeEvent extends BaseSSEEvent {
-  type: 'dag_node';
-  runId: string;
-  nodeId: string;
-  name: string;
-  status: WorkflowStepStatus;
-  duration?: number;
-  error?: string;
-  reason?: 'when_condition' | 'trigger_rule';
-}
+export type DagNodeEvent = components['schemas']['DagNodeSseEvent'];
 
 // Workflow tool activity (tool_started / tool_completed from executor)
 export interface WorkflowToolActivityEvent extends BaseSSEEvent {
@@ -129,6 +156,37 @@ export interface WorkflowToolActivityEvent extends BaseSSEEvent {
   stepName: string;
   status: 'started' | 'completed';
   durationMs?: number;
+}
+
+// Subagent task activity (Phase 3 of #975 — aggregated from Claude provider
+// task_started / task_progress / task_notification chunks). Rendered as
+// expandable sub-items under the parent DAG node in the run detail view.
+export interface WorkflowTaskActivityEvent extends BaseSSEEvent {
+  type: 'workflow_task_activity';
+  runId: string;
+  nodeId: string;
+  taskId: string;
+  activity: 'started' | 'progress' | 'completed' | 'failed' | 'stopped';
+  description?: string;
+  summary?: string;
+  usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
+  lastToolName?: string;
+  taskType?: string;
+}
+
+// Hook activity (Phase 3 of #975 — aggregated from Claude provider
+// hook_started / hook_response chunks). Rendered as inline indicators under
+// the parent node (e.g. "PreToolUse(Bash) → approved").
+export interface WorkflowHookActivityEvent extends BaseSSEEvent {
+  type: 'workflow_hook_activity';
+  runId: string;
+  nodeId: string;
+  hookId: string;
+  hookName: string;
+  hookEvent: string;
+  activity: 'started' | 'response';
+  outcome?: 'success' | 'error' | 'cancelled';
+  exitCode?: number;
 }
 
 // Workflow artifact
@@ -183,6 +241,8 @@ export type SSEEvent =
   | DagNodeEvent
   | LoopIterationEvent
   | WorkflowToolActivityEvent
+  | WorkflowTaskActivityEvent
+  | WorkflowHookActivityEvent
   | WorkflowArtifactEvent
   | WorkflowDispatchEvent
   | WorkflowOutputPreviewEvent
@@ -212,6 +272,13 @@ export interface ChatMessage {
   timestamp: number;
   isStreaming?: boolean;
   files?: FileAttachment[];
+  /**
+   * Category of the `text` event that opened this message. Retained so the next
+   * event can test the *previous* segment's category, the same way
+   * `BufferedSegment.category` works server-side in the web adapter's
+   * `MessagePersistence`.
+   */
+  category?: MessageCategory;
   workflowDispatch?: {
     workerConversationId: string;
     workflowName: string;
@@ -240,16 +307,54 @@ export interface ErrorDisplay {
 
 // Workflow UI State types
 
+/** Subagent task lifecycle entry (Phase 3 of #975). Keyed by `taskId`
+ *  inside a `DagNodeState.tasks` array; mutated in place as progress /
+ *  completion events arrive. */
+export interface DagTaskInfo {
+  taskId: string;
+  /** 'started' | 'progress' | 'completed' | 'failed' | 'stopped' */
+  activity: 'started' | 'progress' | 'completed' | 'failed' | 'stopped';
+  description?: string;
+  /** Most recent AI-generated summary (only present when
+   *  `agentProgressSummaries: true` and the SDK has emitted one). */
+  summary?: string;
+  lastToolName?: string;
+  taskType?: string;
+  usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
+  startedAt: number;
+  updatedAt: number;
+}
+
+/** Hook lifecycle entry (Phase 3 of #975). Keyed by `hookId` inside a
+ *  `DagNodeState.hooks` array; a started/response pair is collapsed into
+ *  one row (response overwrites `outcome` / `exitCode`). */
+export interface DagHookInfo {
+  hookId: string;
+  hookName: string;
+  hookEvent: string;
+  /** 'started' until the matching response arrives, then 'response'. */
+  activity: 'started' | 'response';
+  outcome?: 'success' | 'error' | 'cancelled';
+  exitCode?: number;
+  startedAt: number;
+  updatedAt: number;
+}
+
 export interface DagNodeState {
   nodeId: string;
   name: string;
   status: WorkflowStepStatus;
   duration?: number;
   error?: string;
-  reason?: 'when_condition' | 'trigger_rule';
+  reason?: DagNodeEvent['reason'];
+  cause?: DagNodeEvent['cause'];
   currentIteration?: number;
   maxIterations?: number;
   iterations?: LoopIterationInfo[];
+  /** Subagent tasks spawned by this node (Task tool, inline sub-agents). */
+  tasks?: DagTaskInfo[];
+  /** Hook callbacks fired by this node (PreToolUse, PostToolUse, etc.). */
+  hooks?: DagHookInfo[];
 }
 
 export interface WorkflowArtifact {
@@ -263,6 +368,8 @@ export interface WorkflowState {
   runId: string;
   workflowName: string;
   status: WorkflowRunStatus;
+  /** Complete dashboard snapshot; absent until the run-list projection has been hydrated. */
+  activeNodeIds?: string[];
   dagNodes: DagNodeState[];
   artifacts: WorkflowArtifact[];
   currentIteration?: number;

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { writeFileSync, mkdirSync, rmSync } from 'fs';
 import { join } from 'path';
 import { stripCwdEnv } from './strip-cwd-env';
@@ -26,6 +26,8 @@ describe('stripCwdEnv', () => {
     delete process.env.CLAUDE_CODE_USE_VERTEX;
     delete process.env.NODE_OPTIONS;
     delete process.env.VSCODE_INSPECTOR_OPTIONS;
+    delete process.env.BUN_INSPECT;
+    delete process.env.BUN_INSPECT_NOTIFY;
   });
 
   it('strips keys from single .env file', () => {
@@ -84,6 +86,65 @@ describe('stripCwdEnv', () => {
   });
 });
 
+describe('stripCwdEnv — operator logging (#1302)', () => {
+  const tmpDir = join(import.meta.dir, '__strip-cwd-env-log-test-tmp__');
+  let stderrSpy: ReturnType<typeof spyOn>;
+  let stderrWrites: string[];
+
+  beforeEach(() => {
+    mkdirSync(tmpDir, { recursive: true });
+    stderrWrites = [];
+    stderrSpy = spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      stderrWrites.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.TEST_STRIP_LOG_A;
+    delete process.env.TEST_STRIP_LOG_B;
+    delete process.env.TEST_STRIP_LOG_C;
+  });
+
+  it('emits [archon] stripped line with count and filename when keys are stripped', () => {
+    writeFileSync(join(tmpDir, '.env'), 'TEST_STRIP_LOG_A=leaked\nTEST_STRIP_LOG_B=leaked\n');
+    process.env.TEST_STRIP_LOG_A = 'leaked';
+    process.env.TEST_STRIP_LOG_B = 'leaked';
+    stripCwdEnv(tmpDir);
+    const line = stderrWrites.find(s => s.startsWith('[archon] stripped'));
+    expect(line).toBeDefined();
+    expect(line).toContain('stripped 2 keys');
+    expect(line).toContain(tmpDir);
+    expect(line).toContain('(.env)');
+  });
+
+  it('lists every contributing filename when keys span multiple .env files', () => {
+    writeFileSync(join(tmpDir, '.env'), 'TEST_STRIP_LOG_A=leaked\n');
+    writeFileSync(join(tmpDir, '.env.local'), 'TEST_STRIP_LOG_B=leaked\n');
+    process.env.TEST_STRIP_LOG_A = 'leaked';
+    process.env.TEST_STRIP_LOG_B = 'leaked';
+    stripCwdEnv(tmpDir);
+    const line = stderrWrites.find(s => s.startsWith('[archon] stripped'));
+    expect(line).toBeDefined();
+    expect(line).toContain('(.env, .env.local)');
+  });
+
+  it('emits no [archon] stripped line when no CWD .env files exist', () => {
+    stripCwdEnv(tmpDir);
+    const line = stderrWrites.find(s => s.startsWith('[archon] stripped'));
+    expect(line).toBeUndefined();
+  });
+
+  it('emits no [archon] stripped line when .env file is empty', () => {
+    writeFileSync(join(tmpDir, '.env'), '');
+    stripCwdEnv(tmpDir);
+    const line = stderrWrites.find(s => s.startsWith('[archon] stripped'));
+    expect(line).toBeUndefined();
+  });
+});
+
 describe('stripCwdEnv — nested Claude Code marker stripping', () => {
   const tmpDir = join(import.meta.dir, '__strip-markers-test-tmp__');
 
@@ -104,6 +165,8 @@ describe('stripCwdEnv — nested Claude Code marker stripping', () => {
     delete process.env.CLAUDE_CODE_USE_VERTEX;
     delete process.env.NODE_OPTIONS;
     delete process.env.VSCODE_INSPECTOR_OPTIONS;
+    delete process.env.BUN_INSPECT;
+    delete process.env.BUN_INSPECT_NOTIFY;
   });
 
   it('strips CLAUDECODE from process.env', () => {
@@ -142,6 +205,14 @@ describe('stripCwdEnv — nested Claude Code marker stripping', () => {
     stripCwdEnv(tmpDir);
     expect(process.env.NODE_OPTIONS).toBeUndefined();
     expect(process.env.VSCODE_INSPECTOR_OPTIONS).toBeUndefined();
+  });
+
+  it('strips BUN_INSPECT* vars injected by IDE Bun debuggers', () => {
+    process.env.BUN_INSPECT = 'ws://127.0.0.1:6499/uuid?wait=1';
+    process.env.BUN_INSPECT_NOTIFY = 'http://127.0.0.1:6500';
+    stripCwdEnv(tmpDir);
+    expect(process.env.BUN_INSPECT).toBeUndefined();
+    expect(process.env.BUN_INSPECT_NOTIFY).toBeUndefined();
   });
 
   it('handles combined CWD .env + nested session markers in one call', () => {
